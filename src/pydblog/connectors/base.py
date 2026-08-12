@@ -1,3 +1,4 @@
+
 from datetime import datetime
 from pydblog.connectors.types import SourceType
 from pydblog.connectors.types import LSN
@@ -68,7 +69,14 @@ class SourceConnector(Protocol):
         """
         ...
 
-    def map_lsn_to_timestamp(self, lsn: LSN) -> datetime:
+    def map_lsn_to_timestamp(self, lsn: LSN) -> datetime | None:
+        """
+        Read the commit time recorded against an LSN.
+
+        Returns None when the LSN falls outside the range the log tracks, which is a
+        real answer rather than a failure: an LSN either has a recorded commit time
+        or it does not.
+        """
         ...
 
     def increment_lsn(self, lsn: LSN) -> LSN:
@@ -109,3 +117,5 @@ def build_connector(
                 *args,
                 **kwargs
             )
+        case _ :
+            raise Exception(f"Source of type not defined")

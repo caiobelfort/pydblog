@@ -294,7 +294,10 @@ def test_returns_the_events_the_connector_read(factory_calls):
     dblog = seeded(factory_calls)
     dblog._connector.events = DataFrame({"sale_id": [1, 2]})
 
-    assert dblog._read_window().to_dicts() == [{"sale_id": 1}, {"sale_id": 2}]
+    window = dblog._read_window()
+
+    assert window is not None
+    assert window.to_dicts() == [{"sale_id": 1}, {"sale_id": 2}]
 
 
 def test_advances_the_last_lsn_one_past_the_window(factory_calls):
@@ -548,7 +551,10 @@ def test_returns_the_rows_it_read(factory_calls):
     dblog = dumping(factory_calls)
     dblog._connector.rows = sales(1, 2, 3)
 
-    assert dblog._next_chunk().to_dicts() == sales(1, 2, 3).to_dicts()
+    chunk = dblog._next_chunk()
+
+    assert chunk is not None
+    assert chunk.to_dicts() == sales(1, 2, 3).to_dicts()
 
 
 def test_advances_past_the_last_row_of_the_chunk(factory_calls):
@@ -575,7 +581,10 @@ def test_a_short_chunk_ends_the_dump(factory_calls):
     dblog = dumping(factory_calls, chunk_size=3)
     dblog._connector.rows = sales(1, 2)
 
-    assert dblog._next_chunk().height == 2
+    chunk = dblog._next_chunk()
+
+    assert chunk is not None
+    assert chunk.height == 2
     assert dblog._dump_done is True
 
 
@@ -610,7 +619,7 @@ def test_walks_the_table_one_chunk_at_a_time(factory_calls):
 
     chunks = [dblog._next_chunk(), dblog._next_chunk(), dblog._next_chunk()]
 
-    assert [chunk.height for chunk in chunks] == [2, 2, 1]
+    assert [chunk.height if chunk is not None else None for chunk in chunks] == [2, 2, 1]
     assert [call[1] for call in dblog._connector.read_table_calls] == [None, 3, 9]
     assert dblog._dump_done is True
 

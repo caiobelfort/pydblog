@@ -7,7 +7,7 @@ algorithm can only ever reach for the ten primitives every source must provide â
 second source type needs no change here.
 """
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from types import TracebackType
 
 import logfire
@@ -214,7 +214,7 @@ class DBLog:
         table: str,
         dump: str | None = None,
         from_lsn: LSN | None = None,
-    ) -> Iterator[DataFrame]:
+    ) -> Generator[DataFrame, None, None]:
         """
         Stream a table's changes, optionally interleaved with a dump of its rows.
 

@@ -17,7 +17,6 @@ dependencies = [
 ]
 
 [project.scripts]
-pydblog = "pydblog:main"
 
 [build-system]
 requires = ["uv_build>=0.11.24,<0.12.0"]
@@ -34,3 +33,20 @@ testpaths = ["tests"]
 markers = [
     "integration: needs a real SQL Server; starts one via testcontainers (requires Docker)",
 ]
+
+[tool.pyrefly]
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
+]
+# test_mssql.py imports conftest directly, which is only importable because pytest
+# puts the test directory on sys.path.
+search-path = ["tests"]
+
+# The tests script their stubs through DBLog._connector and DBLog._store, which are
+# declared as the SourceConnector and StateStore Protocols — so the stubs' own
+# attributes are invisible here. That isolation is the point of typing them as
+# Protocols, and it is not worth rewriting ~119 call sites to satisfy the checker.
+[[tool.pyrefly.sub-config]]
+matches = "tests/**"
+errors = { missing-attribute = false }

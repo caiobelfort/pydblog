@@ -7,6 +7,7 @@ which is raw bytes that JSON cannot hold directly.
 """
 
 import json
+from typing import Any
 
 import pytest
 
@@ -14,7 +15,9 @@ from pydblog.state import DumpState, JsonFileStore
 
 
 def state(**overrides) -> DumpState:
-    fields = {
+    # Annotated because the values are of mixed type: without it the `|` below
+    # widens every value to their union and none of them fits its own field.
+    fields: dict[str, Any] = {
         "dump": "sales-backfill",
         "table": "dbo.sales",
         "last_lsn": bytes.fromhex("0000004400007920000b"),

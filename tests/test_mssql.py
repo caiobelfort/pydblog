@@ -15,6 +15,7 @@ tests bring up through testcontainers (see ``conftest.py``).
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from polars import Binary, DataFrame, Datetime, Decimal as PlDecimal, Int32, String
@@ -62,7 +63,9 @@ def make_spec(capture_instance: str | None) -> TableSpec:
 
 def make_read_spec(**overrides) -> TableSpec:
     """A valid read_table spec, with one field at a time swapped out by the test."""
-    fields = {
+    # Annotated because the values are of mixed type: without it the `|` below
+    # widens every value to their union and none of them fits its own field.
+    fields: dict[str, Any] = {
         "source_schema": "dbo",
         "source_table": "sales",
         "pk_columns": ["sale_id"],

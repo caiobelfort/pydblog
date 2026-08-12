@@ -34,7 +34,7 @@ class MSSQLConnector:
         # interpolation — the driver cannot bind an object name. This regex is the barrier.
         self._identifier_pattern = re.compile(r"[A-Za-z0-9_]+")
 
-        self._conn: mssql_python.Connection = None
+        self._conn: mssql_python.Connection | None = None
 
     def _validate_identifier(self, name: str, kind: str = "identifier") -> str:
         """Check that a name can be interpolated into SQL without injection risk.
@@ -72,6 +72,27 @@ class MSSQLConnector:
         """
         return f"[{self._validate_identifier(name, kind)}]"
 
+    def _cursor(self) -> mssql_python.Cursor:
+        """Open a cursor, connecting first if there is no connection yet.
+
+        Every read starts this way, so it lives here rather than being repeated. It
+        is also what lets ``_conn`` stay ``Connection | None``: the guard below turns
+        a type the checker cannot narrow across a call boundary into one it can.
+
+        Returns:
+            A cursor on the open connection.
+
+        Raises:
+            RuntimeError: If the connection is missing after ``connect()`` returned,
+                which it never is.
+        """
+        self.connect()
+
+        if self._conn is None:
+            raise RuntimeError("connect() returned without opening a connection")
+
+        return self._conn.cursor()
+
     def get_min_lsn(self, capture_instance: str) -> LSN:
         """Fetch the oldest LSN CDC still retains for a capture instance.
 
@@ -88,8 +109,7 @@ class MSSQLConnector:
             ValueError: If CDC does not recognise the capture instance, or the caller is
                 not authorized to read its change data.
         """
-        self.connect()
-        cur = self._conn.cursor()
+        cur = self._cursor()
         cur.execute("SELECT sys.fn_cdc_get_min_lsn(?) as min_lsn", [capture_instance])
         row = cur.fetchone()
         cur.close()
@@ -126,8 +146,7 @@ class MSSQLConnector:
             ValueError: If CDC has not produced a watermark yet, which it signals by
                 returning NULL.
         """
-        self.connect()
-        cur = self._conn.cursor()
+        cur = self._cursor()
         cur.execute("SELECT sys.fn_cdc_get_max_lsn() as max_lsn")
         row = cur.fetchone()
         cur.close()
@@ -146,8 +165,7 @@ class MSSQLConnector:
         capture_schema: str = "cdc"
     ) -> TableSpec:
 
-        self.connect()
-        cur = self._conn.cursor()
+        cur = self._cursor()
 
         object_name = f"{schema}.{table}"
 
@@ -234,8 +252,7 @@ class MSSQLConnector:
 
         logfire.debug(f"Generated Query:\n{'='*10}\n{query}")
 
-        self.connect()
-        cur = self._conn.cursor()
+        cur = self._cursor()
         cur.execute(query, [from_lsn, to_lsn])
         arrow_table = cur.arrow()
         cur.close()
@@ -255,14 +272,15 @@ class MSSQLConnector:
         return DataFrame(arrow_table)
 
 
-    def map_lsn_to_timestamp(self, lsn: LSN) -> datetime:
-        self.connect()
-        cur = self._conn.cursor()
+    def map_lsn_to_timestamp(self, lsn: LSN) -> datetime | None:
+        cur = self._cursor()
         cur.execute("SELECT sys.fn_cdc_map_lsn_to_time(?)", [lsn])
         row = cur.fetchone()
         cur.close()
-        return row[0]
 
+        if row:
+            return row[0]
+        return None
 
     def _validate_read_spec(self, spec: TableSpec) -> None:
         """Check a spec can be read from at all.
@@ -392,8 +410,7 @@ class MSSQLConnector:
 
         logfire.debug(f"Generated Query:\n{'='*10}\n{query}")
 
-        self.connect()
-        cur = self._conn.cursor()
+        cur = self._cursor()
         cur.execute(query, params)
         arrow_table = cur.arrow()
         cur.close()
@@ -448,8 +465,7 @@ class MSSQLConnector:
 
         logfire.debug(f"Generated Query:\n{'='*10}\n{query}")
 
-        self.connect()
-        cur = self._conn.cursor()
+        cur = self._cursor()
         cur.execute(query)
         row = cur.fetchone()
         cur.close()
