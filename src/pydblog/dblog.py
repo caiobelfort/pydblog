@@ -130,17 +130,27 @@ class DBLog:
         together and only mean anything together, so honouring a ``from_lsn`` against
         a resumed chunk key would leave a gap between them.
 
-        Otherwise, without a ``from_lsn``, the run opens at the retention floor and
-        reads every event the log still holds. Asking for no particular starting
-        point means asking to skip nothing, and the floor is the earliest there is
-        anything to skip from.
+        Otherwise a dump starting for the first time opens at the present, because its
+        chunks carry the table as it is now and replaying the log's whole retention
+        window would be work that changes nothing. That is the only default there is:
+        a run with no dump has to be given a ``from_lsn``, since with no chunks to
+        establish current state either choice loses something the caller cannot see.
+
+        The present is the later of the source's max LSN and the retention floor. The
+        floor is the higher of the two on a capture instance enabled moments ago, whose
+        start LSN the database-wide max has not reached yet.
+
+        Note that the CDC read is inclusive, so a dump opening at the max LSN sees the
+        event sitting exactly on it a second time. That is the safe direction: the
+        merge drops it, whereas opening one LSN later would lose a write committed at
+        that moment.
 
         Args:
             schema: Schema of the table to read.
             table: Name of the table to read.
             dump: Identity of the dump to run or resume, or None to skip the dump.
-            from_lsn: Where to open the first window, or None to read every event the
-                log still holds.
+            from_lsn: Where to open the first window. None is only allowed for a dump,
+                and means the present.
 
         Raises:
             ValueError: If the table has no capture instance to read a log from, or
@@ -169,6 +179,11 @@ class DBLog:
             start = recorded.last_lsn
         elif from_lsn is not None:
             start = from_lsn
+        elif dump is not None:
+            # The floor matters here: a capture instance enabled moments ago has a
+            # start LSN the database-wide max has not reached, and opening at the bare
+            # max would sit below what the log retains.
+            start = max(self._connector.get_max_lsn(), floor)
         else:
             start = floor
 
@@ -248,9 +263,10 @@ class DBLog:
         table; re-running the same name once the table is done skips the chunks and
         tails the log instead.
 
-        A run with no dump drains the log and stops once it is caught up, rather than
-        polling for more. A caller that wants to tail continuously loops over ``run``
-        itself, handing ``last_lsn`` back in as ``from_lsn`` each time.
+        A run with no dump drains the interval it is given and stops once it is caught
+        up, rather than polling for more. It has to be given one: ``from_lsn`` is
+        required without a dump. A caller that wants to tail continuously loops over
+        ``run`` itself, handing ``last_lsn`` back in as ``from_lsn`` each time.
 
         This is a generator: nothing is read, and none of the errors below are
         raised, until it is iterated.
@@ -259,8 +275,9 @@ class DBLog:
             schema: Schema of the table to read.
             table: Name of the table to read.
             dump: Identity of the dump to run or resume, or None to skip the dump.
-            from_lsn: Where to open the first window, or None to read every event the
-                log still holds. Ignored when the dump has progress recorded.
+            from_lsn: Where to open the first window. None means the present for a
+                dump starting fresh, and every event the log still holds for a run
+                with no dump. Ignored when the dump has progress recorded.
 
         Yields:
             Frames of change events in log order, and, on a dump run, frames of table
@@ -268,12 +285,21 @@ class DBLog:
             columns ahead of the table's.
 
         Raises:
-            ValueError: If the table has no capture instance, or ``dump`` is blank.
+            ValueError: If the table has no capture instance, if ``dump`` is blank, or
+                if neither a ``dump`` nor a ``from_lsn`` was given.
             CdcRetentionExpiredError: If ``from_lsn`` has aged out of the log.
         """
 
         if dump is not None and not dump.strip():
             raise ValueError("dump name is blank: it is the key progress is kept under")
+
+        if dump is None and from_lsn is None:
+            raise ValueError(
+                "a run with no dump needs from_lsn: with no chunks to establish "
+                "current state there is no safe default, since starting at the "
+                "retention floor replays history and starting at the present drops "
+                "it, and neither is visible to the caller"
+            )
 
         self._start(schema, table, dump, from_lsn)
 

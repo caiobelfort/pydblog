@@ -400,24 +400,34 @@ def drain(dblog: DBLog, **kwargs) -> list[DataFrame]:
 def test_inspects_the_table_it_was_asked_for(factory_calls):
     dblog = DBLog(**CONNECTION)
 
-    drain(dblog)
+    drain(dblog, from_lsn=lsn(10))
 
     assert dblog._connector.inspect_calls == [("dbo", "sales")]
     assert dblog._spec == SPEC
 
 
-def test_reads_everything_the_log_still_holds_when_no_lsn_is_given(factory_calls):
-    """No starting point asked for means no events skipped: begin at the floor."""
+def test_an_events_only_run_must_be_told_its_interval(factory_calls):
+    """
+    With no chunks to establish current state, a default would be a guess: start at
+    the floor and history the caller did not want gets replayed, start at the present
+    and history they did want is gone. Neither is detectable, so neither is a default.
+    """
     dblog = DBLog(**CONNECTION)
-    dblog._connector.max_lsn = lsn(100)
-    dblog._connector.min_lsn = lsn(1)
 
-    drain(dblog)
-
-    assert dblog._connector.event_log_calls[0][1] == lsn(1)
+    with pytest.raises(ValueError, match="from_lsn"):
+        drain(dblog)
 
 
-def test_the_floor_itself_is_read(factory_calls):
+def test_the_missing_interval_is_caught_before_the_source_is_touched(factory_calls):
+    dblog = DBLog(**CONNECTION)
+
+    with pytest.raises(ValueError):
+        drain(dblog)
+
+    assert dblog._connector.inspect_calls == []
+
+
+def test_the_floor_itself_is_readable(factory_calls):
     """
     It is the first LSN retained, not the last one gone, and the CDC read is
     inclusive — so an event sitting exactly on it is one of the events to read.
@@ -426,25 +436,78 @@ def test_the_floor_itself_is_read(factory_calls):
     dblog._connector.min_lsn = lsn(40)
     dblog._connector.max_lsn = lsn(40)
 
-    drain(dblog)
+    drain(dblog, from_lsn=lsn(40))
 
     assert dblog._connector.event_log_calls == [(SPEC, lsn(40), lsn(40))]
 
 
-def test_reads_nothing_when_the_floor_is_above_the_max_lsn(factory_calls):
+def test_a_starting_dump_opens_at_the_present(factory_calls):
     """
-    A capture instance enabled moments ago has a start_lsn the database-wide max
-    has not reached yet. There is nothing to read, and asking would be asking CDC
-    for events it never held.
+    The chunks carry the table as it is now, so replaying the whole retention window
+    is work that buys nothing. A dump only needs what changes from the moment it
+    begins.
     """
-    dblog = DBLog(**CONNECTION)
-    dblog._connector.max_lsn = lsn(50)
-    dblog._connector.min_lsn = lsn(200)
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.min_lsn = lsn(1)
+    dblog._connector.max_lsn = lsn(100)
+    dblog._connector.row_script = [sales(1)]
 
-    drain(dblog)
+    full_run(dblog)
+
+    assert dblog._connector.event_log_calls[0][1] == lsn(100)
+
+
+def test_a_starting_dump_falls_back_to_the_floor_above_the_max_lsn(factory_calls):
+    """
+    A capture instance enabled moments ago has a start_lsn the database-wide max has
+    not reached. Opening at the bare max would sit below the floor and be refused as
+    aged out.
+    """
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.min_lsn = lsn(200)
+    dblog._connector.max_lsn = lsn(50)
+    dblog._connector.row_script = [sales(1)]
+
+    full_run(dblog)
 
     assert dblog._last_lsn == lsn(200)
-    assert dblog._connector.event_log_calls == []
+
+
+def test_a_starting_dump_still_honours_an_explicit_lsn(factory_calls):
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.min_lsn = lsn(1)
+    dblog._connector.max_lsn = lsn(100)
+    dblog._connector.row_script = [sales(1)]
+
+    full_run(dblog, from_lsn=lsn(42))
+
+    assert dblog._connector.event_log_calls[0][1] == lsn(42)
+
+
+def test_a_resumed_dump_ignores_the_present(factory_calls):
+    """Opening at the max would skip everything between the record and now."""
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.min_lsn = lsn(1)
+    dblog._connector.max_lsn = lsn(900)
+    dblog._store.states["sales-backfill"] = DumpState(
+        dump="sales-backfill", table="dbo.sales", last_lsn=lsn(500), chunk_key=77
+    )
+    dblog._connector.row_script = [sales(77)]
+
+    full_run(dblog)
+
+    assert dblog._connector.event_log_calls[0][1] == lsn(500)
+
+
+def test_an_unnamed_run_reads_exactly_the_interval_it_was_given(factory_calls):
+    """Only a dump gets a default: its chunks are what make skipping history safe."""
+    dblog = DBLog(**CONNECTION, state_store=StubStore())
+    dblog._connector.min_lsn = lsn(1)
+    dblog._connector.max_lsn = lsn(100)
+
+    drain(dblog, from_lsn=lsn(7))
+
+    assert dblog._connector.event_log_calls[0][1] == lsn(7)
 
 
 def test_starts_where_the_caller_asked(factory_calls):
@@ -481,7 +544,7 @@ def test_refuses_a_table_that_is_not_captured(factory_calls):
     dblog._connector.spec = SPEC.model_copy(update={"capture_instance": None})
 
     with pytest.raises(ValueError, match="capture instance"):
-        drain(dblog)
+        drain(dblog, from_lsn=lsn(10))
 
 
 def test_starting_a_run_clears_the_dump_state(factory_calls):
@@ -489,7 +552,7 @@ def test_starting_a_run_clears_the_dump_state(factory_calls):
     dblog._chunk_key = 999
     dblog._dump_done = True
 
-    drain(dblog)
+    drain(dblog, from_lsn=lsn(10))
 
     assert dblog._chunk_key is None
     assert dblog._dump_done is False
@@ -511,7 +574,7 @@ def test_records_the_dump_it_was_asked_to_run(factory_calls):
 def test_an_unnamed_run_has_no_dump(factory_calls):
     dblog = DBLog(**CONNECTION)
 
-    drain(dblog)
+    drain(dblog, from_lsn=lsn(10))
 
     assert dblog._dump is None
 
