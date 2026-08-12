@@ -1,7 +1,7 @@
+import logging
 import re
 from datetime import datetime
 
-import logfire
 import mssql_python
 from polars import DataFrame
 
@@ -16,6 +16,8 @@ OP_UPDATE_AFTER = 4
 # An LSN is a fixed-width big-endian binary(10), which is why byte order is numeric
 # order and comparing LSNs as plain bytes works.
 LSN_WIDTH = 10
+
+logger = logging.getLogger(__name__)
 
 
 class MSSQLConnector:
@@ -250,19 +252,17 @@ class MSSQLConnector:
             "ORDER BY __$start_lsn, __$seqval"
         )
 
-        logfire.debug(f"Generated Query:\n{'='*10}\n{query}")
+        logger.debug(f"generated query:\n{query}")
 
         cur = self._cursor()
         cur.execute(query, [from_lsn, to_lsn])
         arrow_table = cur.arrow()
         cur.close()
 
-        logfire.info(
-                    "Read event log",
-                    table=spec.qualified_name,
-                    capture_instance=spec.capture_instance,
-                    rows=arrow_table.num_rows,
-                )
+        logger.info(
+            f"read {arrow_table.num_rows} events from {spec.capture_instance} "
+            f"in ({from_lsn.hex()}, {to_lsn.hex()}]"
+        )
 
         if arrow_table.num_rows == 0:
             return None
@@ -408,20 +408,16 @@ class MSSQLConnector:
         """
         query, params = self._build_read_table_query(spec, start_pk, end_pk, limit)
 
-        logfire.debug(f"Generated Query:\n{'='*10}\n{query}")
+        logger.debug(f"generated query:\n{query}")
 
         cur = self._cursor()
         cur.execute(query, params)
         arrow_table = cur.arrow()
         cur.close()
 
-        logfire.info(
-            "Read table",
-            table=spec.qualified_name,
-            start_pk=start_pk,
-            end_pk=end_pk,
-            limit=limit,
-            rows=arrow_table.num_rows,
+        logger.info(
+            f"read {arrow_table.num_rows} rows from {spec.qualified_name} "
+            f"[{start_pk}, {end_pk}) limit={limit}"
         )
 
         # Unlike read_event_log, an empty range returns an empty DataFrame rather than
@@ -463,7 +459,7 @@ class MSSQLConnector:
         """
         query = self._build_pk_range_query(spec)
 
-        logfire.debug(f"Generated Query:\n{'='*10}\n{query}")
+        logger.debug(f"generated query:\n{query}")
 
         cur = self._cursor()
         cur.execute(query)
@@ -471,7 +467,7 @@ class MSSQLConnector:
         cur.close()
 
         if row is None or row[0] is None:
-            logfire.info("Read primary key range", table=spec.qualified_name, empty=True)
+            logger.info(f"read primary key range of {spec.qualified_name}: empty")
             return None
 
         minimum, maximum = row[0], row[1]
@@ -482,8 +478,8 @@ class MSSQLConnector:
                 f"needs an integer key"
             )
 
-        logfire.info(
-            "Read primary key range", table=spec.qualified_name, min_pk=minimum, max_pk=maximum
+        logger.info(
+            f"read primary key range of {spec.qualified_name}: [{minimum}, {maximum}]"
         )
 
         return minimum, maximum
@@ -510,12 +506,15 @@ class MSSQLConnector:
             f"Encrypt={self._encrypt};TrustServerCertificate={self._trust_server_certificate};"
         )
         self._conn = mssql_python.connect(conn_str, autocommit=True)
-        logfire.info("Database connected", host=self._host, port=self._port, user=self._user, app_name=self._application_name)
+        logger.info(
+            f"connected to {self._host}:{self._port}/{self._database} "
+            f"as {self._user} ({self._application_name})"
+        )
 
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
-            logfire.info("Database disconnected", host=self._host, port=self._port, user=self._user, app_name=self._application_name)
+            logger.info(f"disconnected from {self._host}:{self._port}/{self._database}")
             self._conn = None
 
     def increment_lsn(self, lsn: LSN) -> LSN:

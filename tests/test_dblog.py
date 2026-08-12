@@ -10,6 +10,7 @@ Whether those primitives actually work against SQL Server is ``test_mssql.py``'s
 job, and it is already answered there.
 """
 
+import logging
 from datetime import datetime
 
 import pytest
@@ -198,6 +199,28 @@ def test_rejects_a_non_positive_chunk_size(factory_calls, chunk_size):
 # ---------------------------------------------------------------------------
 # State — nothing is known until a run starts
 # ---------------------------------------------------------------------------
+
+
+def test_verbose_turns_the_detail_on(factory_calls):
+    DBLog(**CONNECTION, verbose=True)
+
+    assert logging.getLogger("pydblog").level == logging.DEBUG
+
+
+def test_staying_quiet_is_the_default(factory_calls):
+    """A library that configures logging unasked overrides its host's choices."""
+    package = logging.getLogger("pydblog")
+    package.setLevel(logging.NOTSET)
+
+    DBLog(**CONNECTION)
+
+    assert package.level == logging.NOTSET
+
+
+def test_verbose_does_not_reach_the_connector(factory_calls):
+    DBLog(**CONNECTION, verbose=True)
+
+    assert "verbose" not in factory_calls[0]
 
 
 def test_starts_with_empty_state(factory_calls):

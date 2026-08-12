@@ -14,15 +14,14 @@ import os
 import time
 from pathlib import Path
 
-import logfire
 import pytest
 from testcontainers.core.container import DockerContainer
 
 from pydblog.connectors import build_connector
 from pydblog.connectors.types import TableSpec
 
-# No telemetry during the tests.
-logfire.configure(send_to_logfire=False)
+# The package logs through stdlib logging and installs no handler of its own, so
+# nothing here needs configuring: pytest captures whatever the tests emit.
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent

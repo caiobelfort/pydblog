@@ -7,17 +7,20 @@ algorithm can only ever reach for the ten primitives every source must provide â
 second source type needs no change here.
 """
 
+import logging
 from collections.abc import Generator
 from types import TracebackType
 
-import logfire
 from polars import DataFrame
 
 from pydblog.connectors.base import SourceConnector, build_connector
 from pydblog.connectors.types import LSN, SourceType, TableSpec
+from pydblog.log import configure_logging
 from pydblog.state import DumpState, JsonFileStore, StateStore
 
 DEFAULT_CHUNK_SIZE = 1000
+
+logger = logging.getLogger(__name__)
 
 
 class CdcRetentionExpiredError(RuntimeError):
@@ -52,6 +55,7 @@ class DBLog:
         database: str,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         state_store: StateStore | None = None,
+        verbose: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -68,6 +72,9 @@ class DBLog:
                 width of the log window bracketing it.
             state_store: Where dump progress is kept, so an interrupted dump can be
                 picked up. Defaults to JSON files in the working directory.
+            verbose: Report every step to stderr, down to the generated SQL. Off, the
+                package stays silent and an application's own logging setup governs
+                what, if anything, comes out.
             **kwargs: Passed through to the connector unchanged.
 
         Raises:
@@ -76,6 +83,9 @@ class DBLog:
 
         if chunk_size < 1:
             raise ValueError(f"chunk_size must be at least 1, got {chunk_size}")
+
+        if verbose:
+            configure_logging(verbose=True)
 
         self._connector: SourceConnector = build_connector(
             source_type=source_type,
@@ -175,13 +185,13 @@ class DBLog:
         self._chunk_key = recorded.chunk_key if recorded is not None else None
         self._dump_done = recorded.done if recorded is not None else False
 
-        logfire.info(
-            "Started run",
-            table=spec.qualified_name,
-            dump=dump,
-            resumed=recorded is not None,
-            from_lsn=start.hex(),
-            chunk_key=self._chunk_key,
+        logger.info(
+            f"started {'resumed ' if recorded is not None else ''}run on "
+            f"{spec.qualified_name} dump={dump} from_lsn={start.hex()}"
+        )
+        logger.debug(
+            f"run state: chunk_key={self._chunk_key} dump_done={self._dump_done} "
+            f"floor={floor.hex()} capture_instance={spec.capture_instance}"
         )
 
     def _checkpoint(self) -> None:
@@ -206,6 +216,11 @@ class DBLog:
                 chunk_key=self._chunk_key,
                 done=self._dump_done,
             )
+        )
+
+        logger.debug(
+            f"recorded dump {self._dump!r}: chunk_key={self._chunk_key} "
+            f"last_lsn={self._last_lsn.hex()} done={self._dump_done}"
         )
 
     def run(
@@ -325,12 +340,19 @@ class DBLog:
 
         superseded = window.select(self._spec.pk_columns).unique()
 
-        return chunk.join(
+        merged = chunk.join(
             superseded,
             on=self._spec.pk_columns,
             how="anti",
             maintain_order="left",
         )
+
+        logger.debug(
+            f"merged chunk: {chunk.height} rows, {chunk.height - merged.height} "
+            f"superseded by the window, {merged.height} emitted"
+        )
+
+        return merged
 
     def _next_chunk(self) -> DataFrame | None:
         """
@@ -376,12 +398,9 @@ class DBLog:
 
         self._chunk_key = self._key_after(rows)
 
-        logfire.info(
-            "Read chunk",
-            table=self._spec.qualified_name,
-            dump=self._dump,
-            rows=rows.height,
-            next_chunk_key=self._chunk_key,
+        logger.info(
+            f"read chunk of {rows.height} rows from {self._spec.qualified_name}, "
+            f"next chunk opens at {self._chunk_key}"
         )
 
         return rows
@@ -452,16 +471,23 @@ class DBLog:
 
         high = self._connector.get_max_lsn()
         if self._last_lsn > high:
+            logger.debug(
+                f"no window to read on {self._spec.qualified_name}: "
+                f"{self._last_lsn.hex()} is already past the source's "
+                f"{high.hex()}"
+            )
             return None
 
-        events = self._connector.read_event_log(self._spec, self._last_lsn, high)
+        low = self._last_lsn
+        events = self._connector.read_event_log(self._spec, low, high)
         self._last_lsn = self._connector.increment_lsn(high)
 
-        logfire.info(
-            "Read log window",
-            table=self._spec.qualified_name,
-            events=0 if events is None else events.height,
+        logger.info(
+            f"read window ({low.hex()}, {high.hex()}] on "
+            f"{self._spec.qualified_name}: {0 if events is None else events.height} "
+            "events"
         )
+        logger.debug(f"next window opens at {self._last_lsn.hex()}")
 
         return events
 
