@@ -213,6 +213,68 @@ def wait_until_accepting_connections(container: DockerContainer) -> None:
     )
 
 
+def wait_until_agent_running(container: DockerContainer) -> None:
+    """
+    Block until SQL Server Agent reports itself running.
+
+    Accepting connections is not enough on its own. ``sp_cdc_enable_table`` registers
+    the capture job through msdb, and doing that while the Agent is still coming up
+    fails with error 14258, "Cannot perform this operation while SQLServerAgent is
+    starting". The Agent starts after the engine does, so waiting only for a query to
+    succeed leaves a window where the setup script runs too early — intermittently,
+    and more often on a loaded machine.
+
+    This narrows that window rather than closing it: the Agent reports itself running
+    before it will actually accept a job, which is why ``run_setup_script`` retries.
+    """
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    last_output = b""
+    while time.monotonic() < deadline:
+        result = run_sqlcmd(
+            container,
+            "-h-1",
+            "-W",
+            "-Q",
+            "SET NOCOUNT ON; SELECT status_desc FROM sys.dm_server_services "
+            "WHERE servicename LIKE 'SQL Server Agent%'",
+        )
+        if result.exit_code == 0 and b"Running" in result.output:
+            return
+        last_output = result.output
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    raise RuntimeError(
+        f"SQL Server Agent was not running within {STARTUP_TIMEOUT_SECONDS}s, so CDC "
+        f"cannot be enabled: {last_output.decode(errors='replace')}"
+    )
+
+
+def run_setup_script(container: DockerContainer) -> None:
+    """
+    Run the lab setup, retrying while SQL Server Agent refuses the capture job.
+
+    ``sp_cdc_enable_table`` fails with 14258 until the Agent is far enough along to
+    take a job registration, and the Agent reports itself running before that point —
+    so no status check closes the window, only retrying does.
+
+    The script is written to be idempotent, guarding every object it creates, so a
+    re-run picks up exactly the step that failed and skips the ones that took.
+    """
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    last_output = b""
+    while time.monotonic() < deadline:
+        result = run_sqlcmd(container, "-i", SETUP_SQL)
+        if result.exit_code == 0:
+            return
+        last_output = result.output
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    raise RuntimeError(
+        f"the lab setup did not succeed within {STARTUP_TIMEOUT_SECONDS}s: "
+        f"{last_output.decode(errors='replace')}"
+    )
+
+
 @pytest.fixture(scope="session")
 def sqlserver():
     """An ephemeral SQL Server, with CDC enabled by the project's setup script."""
@@ -235,11 +297,9 @@ def sqlserver():
 
     try:
         wait_until_accepting_connections(container)
+        wait_until_agent_running(container)
 
-        setup = run_sqlcmd(container, "-i", SETUP_SQL)
-        assert setup.exit_code == 0, (
-            f"the setup failed: {setup.output.decode(errors='replace')}"
-        )
+        run_setup_script(container)
 
         yield container
     finally:
