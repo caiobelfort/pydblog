@@ -6,9 +6,12 @@ readme = "README.md"
 authors = [
     { name = "Caio Nogueira Silva Belfort", email = "caio.belfort@grupomateus.com" }
 ]
-requires-python = ">=3.14"
+# 3.12 is the floor because of the PEP 695 `type LSN = bytes` in connectors/types.py.
+# Nothing else in the codebase needs anything newer, and no dependency asks for more
+# than 3.10.
+requires-python = ">=3.12"
 dependencies = [
-    "logfire[pydantic]>=4.38.0",
+    "logfire>=4.38.0",
     "mssql-python>=1.11.0",
     "polars>=1.43.0",
     "pyarrow>=25.0.0",
