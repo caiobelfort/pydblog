@@ -12,6 +12,74 @@ a chunked table dump with the change log, yielding polars DataFrames.
 typed as the `SourceConnector` Protocol, not as `MSSQLConnector`, so the algorithm can
 only reach for the primitives every source must provide. Adding SQL Server specifics
 to `dblog.py` breaks that on purpose — put them behind a Protocol method instead.
+`dblog.py` imports no connector module at all; `build_connector()` in
+`connectors/base.py` is the only construction point.
+
+## Commands
+
+```bash
+uv sync                                   # install, including the dev group
+
+uv run pytest -m "not integration"        # fast suite, no Docker (~0.3s)
+uv run pytest                             # everything, starts SQL Server via testcontainers
+uv run pytest tests/test_dblog.py         # one file
+uv run pytest tests/test_types.py::test_signature_is_the_type_alone   # one test
+uv run pytest -k "rowversion"             # by keyword, across files
+uv run pytest -q -s                       # -s to see print/log output from a probe
+
+uv run pyrefly check src                  # a global uv tool, not a project dep:
+                                          # uv tool install pyrefly
+```
+
+No build step, no linter beyond pyrefly, and `[project.scripts]` is empty — this is a
+library with no CLI yet.
+
+Integration tests are gated on Docker; without it they skip rather than fail. Changing
+`sql/mssql/01_setup.sql` only takes effect on a fresh container, which each pytest
+session creates. The script is idempotent.
+
+## How the pieces fit
+
+Each is unremarkable alone; the shape only makes sense together.
+
+**The run loop** (`DBLog.run()`) is the algorithm, and its ordering is load-bearing:
+
+```
+per chunk pass:
+  _window_low = get_max_lsn()      # before-watermark, for dating this chunk only
+  chunk  = _next_chunk()           # keyset page from _chunk_key
+  window = _read_window()          # (_last_lsn, get_max_lsn()], then _last_lsn = high+1
+  yield window                     # events first
+  yield _merge_chunk(chunk, window)  # = _supersede (anti-join) + to_events (stamp)
+  _checkpoint()                    # after the yields, so a crash cannot skip a chunk
+```
+
+The window closes *after* the chunk scan, so anything committed during the scan lands
+inside it and the chunk cannot carry a stale row the window does not also correct.
+Windows are half-open via `increment_lsn`, because the CDC read is inclusive on both
+bounds.
+
+**The schema pipeline** spans `connectors/types.py`, `connectors/mssql/connector.py`
+and `connectors/mssql/schema.py`:
+
+```
+inspect()  → reads source sys.columns + cdc.<instance>_CT sys.columns
+           → reconciles them (validate) → a frozen TableSpec
+           ↓
+row_schema(spec) / event_schema(spec)   → pyarrow.Schema
+           ↓
+read_table / read_event_log → cur.arrow() → conform(...) → DataFrame
+to_events(rows, spec, ts)   → stamps a dump chunk into the event schema
+```
+
+**Resume** (`state.py`). `DumpState` writes `chunk_key` and `last_lsn` as a unit —
+either alone would leave rows that neither the remaining chunks nor the remaining log
+would deliver. `JsonFileStore` writes to a temp file and `os.replace`s it, so an
+interrupted write leaves the previous state intact. Injecting a `StateStore` is how
+tests avoid the filesystem.
+
+An `LSN` is `bytes` — 10 bytes, big-endian, so byte order is numeric order and plain
+comparison works.
 
 ## The invariant everything rests on
 
@@ -64,7 +132,12 @@ evidence is in `adls/2026-08-13-1730-one-schema-per-run.md`.
   exceptions. No unittest.
 - **Tests first.** Write the test, watch it fail, then implement.
 - Prefer functions and modules over classes; immutable data; explicit over implicit.
-- Record architecture decisions in `adls/`, filename prefixed with a timestamp.
+- **Trunk-based:** commit directly to `main`. Do not create feature branches.
+- Record architecture decisions in `adls/`, filename prefixed with a timestamp, and
+  record what was *measured*, not only what was decided. The existing ADR is written
+  that way, which is why its surprising findings survived review.
+- This file is the only agent-facing doc. Do not add a `CLAUDE.md` or equivalent —
+  put agent guidance here.
 
 ## Test layout
 
@@ -93,3 +166,6 @@ Protocol method and you must add it there too.
   `.to_list()` instead.
 - CDC's capture job runs on its own schedule. A test that writes and then expects an
   event must wait — `conftest.wait_for_cdc` — or it passes alone and fails in a suite.
+- `.claude/AUDIT.md` is a findings document from an earlier review. Several of its
+  findings (F2, F3, F4, F19) are closed; check against current code before acting on
+  any of them.
