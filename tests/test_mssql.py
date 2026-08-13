@@ -24,12 +24,14 @@ from pydblog.connectors import build_connector
 from pydblog.connectors.mssql import (
     LSN_WIDTH,
     OP_DELETE,
+    OP_DUMP,
     OP_INSERT,
     OP_UPDATE_AFTER,
     OP_UPDATE_BEFORE,
     MSSQLConnector,
 )
-from pydblog.connectors.types import TableSpec
+from pydblog.connectors.mssql.schema import event_schema, row_schema
+from pydblog.connectors.types import ColumnSpec, TableSpec
 
 from conftest import (
     DATABASE,
@@ -42,7 +44,13 @@ from conftest import (
 )
 
 # Metadata columns read_event_log exposes, in order, ahead of the business ones.
-CDC_METADATA_COLUMNS = ["start_lsn", "seqval", "operation", "update_mask"]
+CDC_METADATA_COLUMNS = [
+    "start_lsn",
+    "seqval",
+    "operation",
+    "update_mask",
+    "commit_timestamp",
+]
 
 
 def make_connector() -> MSSQLConnector:
@@ -51,18 +59,31 @@ def make_connector() -> MSSQLConnector:
     )
 
 
+def make_columns(names: list[str]) -> list[ColumnSpec]:
+    """Column specs for names whose type does not matter to the test."""
+    return [
+        ColumnSpec(name=name, type_name="int", precision=10, scale=0) for name in names
+    ]
+
+
 def make_spec(capture_instance: str | None) -> TableSpec:
     return TableSpec(
         source_schema="dbo",
         source_table="sales",
         pk_columns=["sale_id"],
-        business_columns=["sale_id"],
+        columns=make_columns(["sale_id"]),
+        captured_columns=make_columns(["sale_id"]),
         capture_instance=capture_instance,
     )
 
 
 def make_read_spec(**overrides) -> TableSpec:
-    """A valid read_table spec, with one field at a time swapped out by the test."""
+    """A valid read_table spec, with one field at a time swapped out by the test.
+
+    ``business_columns`` is derived rather than stored, so it is taken here as the
+    list of names to build both column lists from — which is what the tests that
+    override it are actually saying.
+    """
     # Annotated because the values are of mixed type: without it the `|` below
     # widens every value to their union and none of them fits its own field.
     fields: dict[str, Any] = {
@@ -71,7 +92,10 @@ def make_read_spec(**overrides) -> TableSpec:
         "pk_columns": ["sale_id"],
         "business_columns": ["sale_id", "product_id", "unit_price"],
     }
-    return TableSpec(**(fields | overrides))
+    merged = fields | overrides
+    columns = make_columns(merged.pop("business_columns"))
+
+    return TableSpec(**merged, columns=columns, captured_columns=columns)
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +193,30 @@ def build_params(
         make_read_spec(), start_pk, end_pk, limit
     )
     return params
+
+
+def test_build_read_table_query_nulls_computed_columns():
+    """
+    CDC records no value for a computed column, so a dump row must not carry one
+    either — otherwise the same column is the computed value on a dump row and null
+    on every event for that row, under one schema.
+    """
+    spec = make_read_spec()
+    captured = [
+        column.model_copy(update={"computed_definition": "([quantity]*[unit_price])"})
+        if column.name == "unit_price"
+        else column
+        for column in spec.captured_columns
+    ]
+    query, _ = make_connector()._build_read_table_query(
+        spec.model_copy(update={"captured_columns": captured}), None, None, 0
+    )
+
+    assert query == (
+        "SELECT [sale_id], [product_id], NULL AS [unit_price] "
+        "FROM [dbo].[sales] "
+        "ORDER BY [sale_id]"
+    )
 
 
 def test_build_read_table_query_with_both_bounds():
@@ -447,14 +495,25 @@ def test_inspect_pk_is_subset_of_business_columns(spec):
 
 
 @pytest.mark.integration
-def test_inspect_excludes_computed_columns(spec):
+def test_inspect_keeps_computed_columns(spec):
     """
-    total_amount is a persisted computed column. CDC does not capture it, so inspect()
-    has to leave it out — otherwise read_event_log would build a SELECT naming a column
-    that does not exist in the change table.
+    total_amount is a persisted computed column. CDC gives it a column in the change
+    table and never puts a value in it, which is the shape SQL Server chose and the
+    one this follows: the column is read, always null, on both sides.
     """
-    assert "total_amount" not in spec.business_columns
+    assert "total_amount" in spec.business_columns
     assert "unit_price" in spec.business_columns
+
+
+@pytest.mark.integration
+def test_inspect_carries_the_formula_of_a_computed_column(spec):
+    """Null on every row, so the expression is all a consumer has to recompute from."""
+    total_amount = next(
+        column for column in spec.captured_columns if column.name == "total_amount"
+    )
+
+    assert total_amount.is_computed
+    assert "unit_price" in total_amount.computed_definition
 
 
 @pytest.mark.integration
@@ -469,6 +528,37 @@ def test_inspect_raises_without_primary_key(connector):
             connector.inspect("dbo", "pydblog_no_pk")
     finally:
         execute(connector, "DROP TABLE IF EXISTS dbo.pydblog_no_pk")
+
+
+@pytest.mark.integration
+def test_inspect_refuses_a_table_a_captured_column_was_dropped_from(connector):
+    """
+    dbo.pydblog_drift had legacy_note dropped after CDC captured it. SQL Server keeps
+    the column in the change table, so the log read would project a column the table
+    read cannot — a disagreement that otherwise surfaces at the concat, long after a
+    dump has checkpointed progress against the chunk it breaks.
+    """
+    with pytest.raises(ValueError, match=r"'legacy_note' is no longer in"):
+        connector.inspect("dbo", "pydblog_drift")
+
+
+@pytest.mark.integration
+def test_the_drift_fixture_really_is_drifted(connector):
+    """
+    Guards the test above. A dropped column is the drift that stays drifted: a type
+    change would not do, because SQL Server propagates ALTER COLUMN to the change
+    table and the two sides stay in step.
+    """
+    cur = connector._cursor()
+    source = {column.name for column in connector._read_columns(cur, "dbo.pydblog_drift")}
+    captured = {
+        column.name
+        for column in connector._read_captured_columns(cur, "dbo_pydblog_drift", "cdc")
+    }
+    cur.close()
+
+    assert "legacy_note" in captured
+    assert "legacy_note" not in source
 
 
 @pytest.mark.integration
@@ -496,6 +586,44 @@ def test_read_event_log_column_order_is_metadata_then_business(connector, spec, 
         spec, change_window["from_lsn"], change_window["to_lsn"]
     )
     assert events.columns == CDC_METADATA_COLUMNS + spec.business_columns
+
+
+@pytest.mark.integration
+def test_read_event_log_carries_the_commit_time_of_each_event(connector, spec, change_window):
+    """Read alongside the events rather than mapped per LSN afterwards."""
+    events = connector.read_event_log(
+        spec, change_window["from_lsn"], change_window["to_lsn"]
+    )
+
+    assert events["commit_timestamp"].null_count() == 0
+
+
+@pytest.mark.integration
+def test_read_event_log_conforms_to_the_declared_schema(connector, spec, change_window):
+    """
+    The point of the exercise: dtypes come from the metadata inspect() read, not from
+    whatever this particular result set let the driver infer.
+    """
+    events = connector.read_event_log(
+        spec, change_window["from_lsn"], change_window["to_lsn"]
+    )
+
+    assert events.schema == DataFrame(event_schema(spec).empty_table()).schema
+
+
+@pytest.mark.integration
+def test_read_table_conforms_to_the_declared_schema(connector, spec):
+    """A computed column is projected as an untyped NULL, so this is what types it."""
+    rows = connector.read_table(spec)
+
+    assert rows.schema == DataFrame(row_schema(spec).empty_table()).schema
+
+
+@pytest.mark.integration
+def test_read_table_types_a_computed_column_from_its_declaration(connector, spec):
+    assert connector.read_table(spec).schema["total_amount"] == PlDecimal(
+        precision=12, scale=2
+    )
 
 
 @pytest.mark.integration
@@ -800,7 +928,10 @@ def test_read_table_orders_by_pk_not_present_in_selected_columns(connector, pagi
     The PK stays out of the SELECT but remains in the ORDER BY — T-SQL allows it, and
     it is what lets us read only the requested columns without losing the chunk order.
     """
-    spec_without_pk = paging_spec.model_copy(update={"business_columns": ["label"]})
+    label = next(
+        column for column in paging_spec.captured_columns if column.name == "label"
+    )
+    spec_without_pk = paging_spec.model_copy(update={"captured_columns": [label]})
     df = connector.read_table(spec_without_pk)
 
     assert df.columns == ["label"]
@@ -816,9 +947,75 @@ def test_read_table_reads_the_inspected_spec_of_dbo_sales(connector, spec):
     df = connector.read_table(spec)
 
     assert df.columns == spec.business_columns
-    assert "total_amount" not in df.columns  # computed, excluded by inspect
+    # Computed, so read as null here to match what the change log records for it.
+    assert df["total_amount"].null_count() == df.height
     assert df["sale_id"].to_list() == sorted(df["sale_id"].to_list())
     assert df.schema["unit_price"] == PlDecimal(precision=10, scale=2)
+
+
+# ---------------------------------------------------------------------------
+# to_events — stamping dump rows into the event schema, no database
+# ---------------------------------------------------------------------------
+
+
+def dump_chunk() -> DataFrame:
+    return DataFrame(
+        {"sale_id": [1, 2], "product_id": [10, 20], "unit_price": [5, 6]},
+        schema={"sale_id": Int32, "product_id": Int32, "unit_price": Int32},
+    )
+
+
+def stamped(commit_timestamp: datetime | None = None) -> DataFrame:
+    return make_connector().to_events(dump_chunk(), make_read_spec(), commit_timestamp)
+
+
+def test_to_events_lands_on_the_event_schema():
+    assert stamped().schema == DataFrame(
+        event_schema(make_read_spec()).empty_table()
+    ).schema
+
+
+@pytest.mark.parametrize("name", ["start_lsn", "seqval"])
+def test_to_events_marks_dump_rows_with_an_all_zero_lsn(name):
+    """
+    Zero is an LSN CDC never issues, so it reads unambiguously as a row taken off the
+    table rather than out of the log — and it sorts every dump row below every event,
+    which is the precedence the merge already gives them.
+    """
+    assert stamped()[name].to_list() == [bytes(LSN_WIDTH)] * 2
+
+
+def test_to_events_marks_dump_rows_with_an_all_zero_update_mask():
+    """
+    Zero, and the width a real mask has: one bit per captured column, so three
+    columns fit in a single byte. A mask of some other width would not parse.
+    """
+    assert stamped()["update_mask"].to_list() == [bytes(1)] * 2
+
+
+def test_to_events_marks_dump_rows_with_the_dump_operation():
+    assert stamped()["operation"].to_list() == [OP_DUMP] * 2
+
+
+def test_to_events_carries_the_commit_time_it_is_given():
+    committed_at = datetime(2026, 8, 13, 12, 30)
+
+    assert stamped(committed_at)["commit_timestamp"].to_list() == [committed_at] * 2
+
+
+def test_to_events_accepts_no_commit_time():
+    """map_lsn_to_timestamp returns None for an LSN the log records no time for."""
+    assert stamped()["commit_timestamp"].null_count() == 2
+
+
+def test_to_events_keeps_the_rows_it_was_given():
+    assert stamped()["sale_id"].to_list() == [1, 2]
+
+
+def test_to_events_keeps_an_empty_chunk_empty():
+    empty = dump_chunk().clear()
+
+    assert make_connector().to_events(empty, make_read_spec(), None).height == 0
 
 
 # ---------------------------------------------------------------------------

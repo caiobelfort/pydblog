@@ -107,6 +107,7 @@ class DBLog:
         self._last_lsn: LSN | None = None  # log position reached; next window opens here
         self._chunk_key: int | None = None  # leading PK the next chunk starts at
         self._dump_done: bool = False  # set once a chunk comes back short
+        self._window_low: LSN | None = None  # log position the current chunk is dated from
 
     @property
     def last_lsn(self) -> LSN | None:
@@ -281,8 +282,11 @@ class DBLog:
 
         Yields:
             Frames of change events in log order, and, on a dump run, frames of table
-            rows. The two have different shapes: events carry the log's metadata
-            columns ahead of the table's.
+            rows. Both carry the log's metadata columns ahead of the table's and share
+            one schema, so the whole run stacks into a single frame. Rows that came
+            off the table rather than out of the log are marked as such: their LSN
+            columns are all zeros, a position the log never issues, which also orders
+            them below every event.
 
         Raises:
             ValueError: If the table has no capture instance, if ``dump`` is blank, or
@@ -305,6 +309,12 @@ class DBLog:
 
         if dump is not None and not self._dump_done:
             while not self._dump_done:
+                # The watermark this pass dates its chunk from, taken before the scan
+                # starts. It is only ever used for that: the window still opens at
+                # _last_lsn, and opening it here instead would skip everything
+                # committed between where the last window closed and this moment.
+                self._window_low = self._connector.get_max_lsn()
+
                 # Order is the algorithm. _last_lsn already sits where the previous
                 # window closed, which is a position the log had reached before this
                 # scan began; the window then closes at the max LSN once the scan is
@@ -334,7 +344,7 @@ class DBLog:
             yield events
             self._checkpoint()
 
-    def _merge_chunk(self, chunk: DataFrame, window: DataFrame | None) -> DataFrame:
+    def _supersede(self, chunk: DataFrame, window: DataFrame | None) -> DataFrame:
         """
         Drop the chunk rows the window already carries.
 
@@ -379,6 +389,39 @@ class DBLog:
         )
 
         return merged
+
+    def _merge_chunk(self, chunk: DataFrame, window: DataFrame | None) -> DataFrame:
+        """
+        Drop what the window supersedes, then stamp what is left into an event.
+
+        The stamping is what makes a dump run yield one schema: the frame a chunk
+        produces ends up with the same columns as the frame a window produces, so a
+        consumer can stack every frame of the run without reconciling two layouts.
+
+        The commit time comes from the watermark taken before the chunk was read.
+        Anything committed after it that touches a chunk row falls inside the window
+        and supersedes it, so no row that survives here is older than that watermark —
+        which is what makes it the honest claim rather than merely a convenient one.
+
+        Args:
+            chunk: Rows read from the table.
+            window: Events from the log window bracketing that read, or None.
+
+        Returns:
+            The surviving rows, in the event schema.
+
+        Raises:
+            RuntimeError: If the run state has not been seeded yet.
+        """
+
+        if self._spec is None or self._window_low is None:
+            raise RuntimeError("run not started: no window to date the chunk against")
+
+        return self._connector.to_events(
+            self._supersede(chunk, window),
+            self._spec,
+            self._connector.map_lsn_to_timestamp(self._window_low),
+        )
 
     def _next_chunk(self) -> DataFrame | None:
         """

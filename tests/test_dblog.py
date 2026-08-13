@@ -14,10 +14,10 @@ import logging
 from datetime import datetime
 
 import pytest
-from polars import DataFrame
+from polars import Binary, DataFrame, Datetime, Int32, all, lit
 
 import pydblog.dblog
-from pydblog.connectors.types import LSN, TableSpec
+from pydblog.connectors.types import LSN, ColumnSpec, TableSpec
 from pydblog.dblog import DEFAULT_CHUNK_SIZE, CdcRetentionExpiredError, DBLog
 from pydblog.state import DumpState
 
@@ -31,13 +31,22 @@ CONNECTION = {
 }
 
 
+COLUMNS = [
+    ColumnSpec(name="sale_id", type_name="int", precision=10, scale=0),
+    ColumnSpec(name="amount", type_name="decimal", precision=10, scale=2),
+]
+
 SPEC = TableSpec(
     source_schema="dbo",
     source_table="sales",
     pk_columns=["sale_id"],
-    business_columns=["sale_id", "amount"],
+    columns=COLUMNS,
+    captured_columns=COLUMNS,
     capture_instance="dbo_sales",
 )
+
+
+COMMIT_TIME = datetime(2026, 8, 13, 12, 30)
 
 
 def lsn(value: int) -> LSN:
@@ -71,6 +80,8 @@ class StubConnector:
         self.event_log_calls: list[tuple[TableSpec, LSN, LSN]] = []
         self.read_table_calls: list[tuple[TableSpec, int | None, int | None, int]] = []
         self.inspect_calls: list[tuple[str, str]] = []
+        self.map_lsn_calls: list[LSN] = []
+        self.to_events_calls: list[tuple[DataFrame, datetime | None]] = []
         # Every read in the order it happened. The interleave is as much about
         # sequence as about results: the window has to close after the chunk scan.
         self.calls: list[str] = []
@@ -118,8 +129,21 @@ class StubConnector:
     def read_pk_range(self, spec: TableSpec) -> tuple[int, int] | None:
         return None
 
-    def map_lsn_to_timestamp(self, value: LSN) -> datetime:
-        raise NotImplementedError
+    def map_lsn_to_timestamp(self, value: LSN) -> datetime | None:
+        self.map_lsn_calls.append(value)
+        return COMMIT_TIME
+
+    def to_events(
+        self, rows: DataFrame, spec: TableSpec, commit_timestamp: datetime | None
+    ) -> DataFrame:
+        """Stamps the way MSSQLConnector does, so the merge assertions see the shape."""
+        self.to_events_calls.append((rows, commit_timestamp))
+        return rows.select(
+            lit(bytes(10), Binary).alias("start_lsn"),
+            lit(0, Int32).alias("operation"),
+            lit(commit_timestamp, Datetime("us")).alias("commit_timestamp"),
+            all(),
+        )
 
     def increment_lsn(self, value: LSN) -> LSN:
         return lsn(int.from_bytes(value, "big") + 1)
@@ -748,7 +772,7 @@ def test_refuses_to_read_a_chunk_before_the_run_state_is_seeded(factory_calls):
 
 
 # ---------------------------------------------------------------------------
-# _merge_chunk — the log wins, because its image is the newer one
+# _supersede — the log wins, because its image is the newer one
 # ---------------------------------------------------------------------------
 
 
@@ -767,7 +791,7 @@ def events(*sale_ids: int) -> DataFrame:
 def test_a_chunk_survives_a_window_that_held_no_events(factory_calls):
     dblog = dumping(factory_calls)
 
-    merged = dblog._merge_chunk(sales(1, 2, 3), None)
+    merged = dblog._supersede(sales(1, 2, 3), None)
 
     assert merged.to_dicts() == sales(1, 2, 3).to_dicts()
 
@@ -775,7 +799,7 @@ def test_a_chunk_survives_a_window_that_held_no_events(factory_calls):
 def test_a_chunk_survives_an_empty_window_frame(factory_calls):
     dblog = dumping(factory_calls)
 
-    merged = dblog._merge_chunk(sales(1, 2, 3), events())
+    merged = dblog._supersede(sales(1, 2, 3), events())
 
     assert merged.to_dicts() == sales(1, 2, 3).to_dicts()
 
@@ -784,7 +808,7 @@ def test_drops_the_chunk_rows_the_window_already_carries(factory_calls):
     """The event is the newer image of that row; the chunk's copy is stale."""
     dblog = dumping(factory_calls)
 
-    merged = dblog._merge_chunk(sales(1, 2, 3), events(2))
+    merged = dblog._supersede(sales(1, 2, 3), events(2))
 
     assert merged["sale_id"].to_list() == [1, 3]
 
@@ -793,7 +817,7 @@ def test_keeps_the_chunk_in_key_order(factory_calls):
     """Chunks arrive ordered by primary key, and an unordered join would lose that."""
     dblog = dumping(factory_calls)
 
-    merged = dblog._merge_chunk(sales(1, 2, 3, 4, 5, 6), events(3))
+    merged = dblog._supersede(sales(1, 2, 3, 4, 5, 6), events(3))
 
     assert merged["sale_id"].to_list() == [1, 2, 4, 5, 6]
 
@@ -801,14 +825,14 @@ def test_keeps_the_chunk_in_key_order(factory_calls):
 def test_a_window_that_covers_the_whole_chunk_leaves_nothing(factory_calls):
     dblog = dumping(factory_calls)
 
-    assert dblog._merge_chunk(sales(1, 2), events(1, 2)).is_empty()
+    assert dblog._supersede(sales(1, 2), events(1, 2)).is_empty()
 
 
 def test_a_row_touched_twice_in_the_window_is_dropped_once(factory_calls):
     """An insert then an update inside one window is two events for one key."""
     dblog = dumping(factory_calls)
 
-    merged = dblog._merge_chunk(sales(1, 2, 3), events(2, 2))
+    merged = dblog._supersede(sales(1, 2, 3), events(2, 2))
 
     assert merged["sale_id"].to_list() == [1, 3]
 
@@ -816,7 +840,7 @@ def test_a_row_touched_twice_in_the_window_is_dropped_once(factory_calls):
 def test_events_for_rows_outside_the_chunk_change_nothing(factory_calls):
     dblog = dumping(factory_calls)
 
-    merged = dblog._merge_chunk(sales(1, 2), events(90, 91))
+    merged = dblog._supersede(sales(1, 2), events(90, 91))
 
     assert merged["sale_id"].to_list() == [1, 2]
 
@@ -825,7 +849,7 @@ def test_the_merged_chunk_keeps_the_table_columns(factory_calls):
     """The window's metadata columns must not leak into the chunk's schema."""
     dblog = dumping(factory_calls)
 
-    merged = dblog._merge_chunk(sales(1, 2), events(1))
+    merged = dblog._supersede(sales(1, 2), events(1))
 
     assert merged.columns == ["sale_id", "amount"]
 
@@ -839,7 +863,7 @@ def test_matches_on_every_primary_key_column(factory_calls):
         {"operation": [4], "tenant_id": [1], "sale_id": [7], "amount": [99]}
     )
 
-    merged = dblog._merge_chunk(chunk, window)
+    merged = dblog._supersede(chunk, window)
 
     assert merged.to_dicts() == [
         {"tenant_id": 1, "sale_id": 8},
@@ -896,6 +920,72 @@ def test_the_window_supersedes_the_chunk_rows_it_covers(factory_calls):
     frames = full_run(dblog, from_lsn=lsn(10))
 
     assert [frame["sale_id"].to_list() for frame in frames] == [[2], [1, 3], [4]]
+
+
+def test_chunk_frames_are_stamped_into_the_event_shape(factory_calls):
+    """A dump run yields one schema, so a consumer can stack every frame it gets."""
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2)]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+
+    frames = full_run(dblog, from_lsn=lsn(10))
+
+    assert frames[0].columns[:3] == ["start_lsn", "operation", "commit_timestamp"]
+
+
+def test_chunk_frames_are_stamped_even_when_the_window_was_empty(factory_calls):
+    """The early return for an empty window used to skip straight past the stamping."""
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2)]
+    dblog._connector.event_script = [None]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+
+    frames = full_run(dblog, from_lsn=lsn(10))
+
+    assert frames[0]["operation"].to_list() == [0, 0]
+
+
+def test_chunk_frames_are_dated_from_the_watermark_before_the_chunk(factory_calls):
+    """
+    A chunk pass takes two watermarks, one before the read and one after, and the
+    chunk is dated from the one before: every change committed after it lands inside
+    the window and supersedes the chunk, so no surviving row is older than it.
+
+    lsn(200) is the max before the chunk, lsn(300) the max after. Dating from the
+    latter would claim the rows are current as of a moment they were not read at.
+    """
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2)]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+
+    full_run(dblog, from_lsn=lsn(10))
+
+    assert dblog._connector.map_lsn_calls == [lsn(200)]
+
+
+def test_the_chunk_watermark_is_a_position_the_log_actually_reached(factory_calls):
+    """
+    Not _last_lsn. That sits one past where the previous window closed, which is a
+    position nothing ever committed at — CDC records no time for it, so dating from
+    it leaves every chunk after the first with no timestamp at all.
+    """
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2), sales(3)]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400), lsn(500)]
+
+    full_run(dblog, from_lsn=lsn(10))
+
+    assert dblog._connector.map_lsn_calls == [lsn(200), lsn(400)]
+
+
+def test_the_stamped_commit_time_reaches_the_frame(factory_calls):
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2)]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+
+    frames = full_run(dblog, from_lsn=lsn(10))
+
+    assert frames[0]["commit_timestamp"].to_list() == [COMMIT_TIME] * 2
 
 
 def test_a_chunk_wholly_superseded_is_not_emitted(factory_calls):
