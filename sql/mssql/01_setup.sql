@@ -114,5 +114,48 @@ BEGIN
 END
 GO
 
+-- 7) Schema drift fixture — CDC enabled, then a captured column dropped underneath it.
+--    A dropped column is the drift SQL Server does not paper over: it stays in the
+--    change table (unpopulated from then on) while the source loses it, so the log
+--    read would project a column the table read cannot. inspect() has to refuse that.
+--    Note a type change would NOT do: ALTER COLUMN is propagated to the change table,
+--    so both sides stay in step and there is nothing to catch.
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'pydblog_drift' AND schema_id = SCHEMA_ID('dbo'))
+BEGIN
+    PRINT 'Creating table dbo.pydblog_drift...';
+    CREATE TABLE dbo.pydblog_drift (
+        drift_id     INT            NOT NULL IDENTITY(1,1),
+        amount       DECIMAL(10,2)  NOT NULL,
+        legacy_note  NVARCHAR(50)   NULL,
+        CONSTRAINT pk_pydblog_drift PRIMARY KEY CLUSTERED (drift_id)
+    );
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM cdc.change_tables WHERE source_object_id = OBJECT_ID('dbo.pydblog_drift')
+)
+BEGIN
+    PRINT 'Enabling CDC on dbo.pydblog_drift...';
+    EXEC sys.sp_cdc_enable_table
+        @source_schema        = N'dbo',
+        @source_name          = N'pydblog_drift',
+        @role_name            = NULL,
+        @capture_instance     = N'dbo_pydblog_drift',
+        @supports_net_changes = 1;
+END
+GO
+
+-- After CDC, deliberately: the change table has already captured the column.
+IF EXISTS (
+    SELECT 1 FROM sys.columns
+    WHERE object_id = OBJECT_ID('dbo.pydblog_drift') AND name = 'legacy_note'
+)
+BEGIN
+    PRINT 'Dropping dbo.pydblog_drift.legacy_note to force schema drift...';
+    ALTER TABLE dbo.pydblog_drift DROP COLUMN legacy_note;
+END
+GO
+
 PRINT 'Setup complete.';
 GO

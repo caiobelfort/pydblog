@@ -1,13 +1,18 @@
 import logging
 import re
 from datetime import datetime
+from math import ceil
 
 import mssql_python
-from polars import DataFrame
+from polars import Binary, DataFrame, Datetime, Int32, all, lit
 
 from pydblog.connectors.base import LSN, TableSpec
+from pydblog.connectors.mssql.schema import conform, event_schema, row_schema, validate
+from pydblog.connectors.types import ColumnSpec
 
-# CDC operation codes, from the __$operation column.
+# CDC operation codes, from the __$operation column. Zero is not one of them, which
+# is what makes it available to mark a row that came off the table rather than the log.
+OP_DUMP = 0
 OP_DELETE = 1
 OP_INSERT = 2
 OP_UPDATE_BEFORE = 3
@@ -18,6 +23,11 @@ OP_UPDATE_AFTER = 4
 LSN_WIDTH = 10
 
 logger = logging.getLogger(__name__)
+
+
+def _mask_width(spec: TableSpec) -> int:
+    """Bytes in a change table's update mask: one bit per captured column."""
+    return ceil(len(spec.business_columns) / 8)
 
 
 class MSSQLConnector:
@@ -161,16 +171,13 @@ class MSSQLConnector:
 
         return row[0]
 
-    def inspect(self,
-        schema: str,
-        table: str,
-        capture_schema: str = "cdc"
-    ) -> TableSpec:
+    def _read_pk_columns(self, cur: mssql_python.Cursor, object_name: str) -> list[str]:
+        """Read a table's primary key columns in key order.
 
-        cur = self._cursor()
-
-        object_name = f"{schema}.{table}"
-
+        Raises:
+            ValueError: If the table has no primary key, which is also how an unknown
+                table surfaces: OBJECT_ID returns NULL and the index join finds nothing.
+        """
         cur.execute(
             "SELECT c.name FROM sys.indexes i "
             "JOIN sys.index_columns ic ON ic.object_id = i.object_id "
@@ -187,44 +194,156 @@ class MSSQLConnector:
         if not pk_columns:
             raise ValueError(f"{object_name} does not have primary key")
 
+        return pk_columns
+
+    def _read_columns(
+        self, cur: mssql_python.Cursor, object_name: str
+    ) -> list[ColumnSpec]:
+        """Read an object's columns, with the type metadata, in ordinal order.
+
+        Serves both the source table and the change table: the latter is an ordinary
+        table too, which is why its captured types can be read the same way rather
+        than out of ``cdc.captured_columns`` — that view records the type name but
+        neither the precision nor the scale, and a decimal needs both.
+        """
         cur.execute(
-            "SELECT c.name, t.name AS type_name, c.precision, c.scale "
+            "SELECT c.name, t.name AS type_name, c.precision, c.scale, cc.definition "
             "FROM sys.columns c "
             "JOIN sys.types t ON t.user_type_id = c.user_type_id "
-            "WHERE c.object_id = OBJECT_ID(?) AND c.is_computed = 0 "
+            "LEFT JOIN sys.computed_columns cc "
+            "ON cc.object_id = c.object_id AND cc.column_id = c.column_id "
+            "WHERE c.object_id = OBJECT_ID(?) "
             "ORDER BY c.column_id",
             [object_name],
         )
 
-        business_columns: list[str] = []
-        for name, type_name, precision, scale in cur.fetchall():
-            business_columns.append(name)
+        return [
+            ColumnSpec(
+                name=name,
+                type_name=type_name,
+                precision=precision,
+                scale=scale,
+                computed_definition=definition,
+            )
+            for name, type_name, precision, scale, definition in cur.fetchall()
+        ]
 
+    def _read_capture_instance(
+        self, cur: mssql_python.Cursor, object_name: str, capture_schema: str
+    ) -> str | None:
+        """Read the capture instance CDC keeps for a table, or None if there is none."""
+        cur.execute(
+            f"SELECT ct.capture_instance "
+            f"FROM {capture_schema}.change_tables ct "
+            f"WHERE ct.source_object_id = OBJECT_ID(?)",
+            [object_name],
+        )
+        row = cur.fetchone()
 
+        return row[0] if row else None
+
+    def _read_captured_columns(
+        self, cur: mssql_python.Cursor, capture_instance: str, capture_schema: str
+    ) -> list[ColumnSpec]:
+        """Read the business columns of a capture instance's change table.
+
+        The change table holds the log's own columns ahead of the table's, all named
+        with a ``__$`` prefix the source cannot use, so dropping that prefix leaves
+        exactly the captured columns — in the order the change table stores them,
+        which is the order every event read returns.
+        """
+        change_table = (
+            f"{capture_schema}."
+            f"{self._validate_identifier(capture_instance, 'capture instance')}_CT"
+        )
+
+        return [
+            column
+            for column in self._read_columns(cur, change_table)
+            if not column.name.startswith("__$")
+        ]
+
+    def _mark_computed(
+        self, captured: list[ColumnSpec], source: list[ColumnSpec]
+    ) -> list[ColumnSpec]:
+        """Carry each computed column's formula over from the source table.
+
+        The change table holds a computed column as a plain one and never puts a value
+        in it, so the formula only exists on the source side. Copying it here is what
+        lets both reads null the column deliberately, and what leaves a consumer the
+        expression to recompute from.
+        """
+        formulas = {
+            column.name: column.computed_definition
+            for column in source
+            if column.is_computed
+        }
+
+        if formulas:
+            logger.info(f"computed columns read as null: {sorted(formulas)}")
+
+        return [
+            column.model_copy(update={"computed_definition": formulas[column.name]})
+            if column.name in formulas
+            else column
+            for column in captured
+        ]
+
+    def inspect(self, schema: str, table: str, capture_schema: str = "cdc") -> TableSpec:
+        """Read the metadata every read of a table is driven from.
+
+        The two column lists are read separately and reconciled here, because they are
+        what the two read paths project and they are free to disagree: CDC records a
+        column's type when capture is enabled and keeps it, so a later ``ALTER COLUMN``
+        leaves the change table returning one type and the source table another.
+        Catching that here costs a query; catching it partway through a dump costs the
+        chunk that was in flight when the cast failed.
+
+        Args:
+            schema: Schema of the table to inspect.
+            table: Name of the table to inspect.
+            capture_schema: Schema CDC keeps its own objects in.
+
+        Returns:
+            The table's metadata, with a schema both read paths can conform to.
+
+        Raises:
+            ValueError: If the table has no primary key, if the two column lists
+                cannot produce one schema, or if a column has no Arrow equivalent.
+        """
+        cur = self._cursor()
+        object_name = f"{schema}.{table}"
+
+        pk_columns = self._read_pk_columns(cur, object_name)
+        # Ahead of the columns, because the change table's name is built from it.
+        capture_instance = self._read_capture_instance(cur, object_name, capture_schema)
+        columns = self._read_columns(cur, object_name)
+        captured_columns = (
+            # With no change log there is nothing to reconcile against, and the
+            # table's own columns are what a read projects.
+            columns
+            if capture_instance is None
+            else self._mark_computed(
+                self._read_captured_columns(cur, capture_instance, capture_schema),
+                columns,
+            )
+        )
 
         spec = TableSpec(
             source_schema=schema,
             source_table=table,
             pk_columns=pk_columns,
-            business_columns=business_columns,
+            columns=columns,
+            captured_columns=captured_columns,
+            capture_instance=capture_instance,
         )
+        cur.close()
 
-        cur.execute(
-            f"""
-            SELECT
-                ct.capture_instance
-            FROM {capture_schema}.change_tables ct
-            JOIN sys.tables t
-                ON ct.source_object_id = t.object_id
-            JOIN sys.schemas s
-                ON t.schema_id = s.schema_id
-            WHERE source_object_id = OBJECT_ID(?)
-            """,
-            [object_name],
-        )
-        row = cur.fetchone()
-        if row:
-            spec.capture_instance = row[0]
+        # Nothing to reconcile without a change table, and a table that has no capture
+        # instance already fails with a clearer message when a run starts on it.
+        if capture_instance is not None:
+            validate(spec)
+
         return spec
 
 
@@ -243,8 +362,15 @@ class MSSQLConnector:
             "__$seqval AS seqval",
             "__$operation AS operation",
             "__$update_mask AS update_mask",
+            # Read here rather than mapped per LSN afterwards: the commit time is a
+            # property of the event, and one round trip carries the whole window.
+            "sys.fn_cdc_map_lsn_to_time(__$start_lsn) AS commit_timestamp",
         ]
-        columns += [self._quote_identifier(col, "business column") for col in spec.business_columns]
+        # Every captured column, computed ones included — CDC records them as null,
+        # which is what a dump row carries for them too.
+        columns += [
+            self._quote_identifier(col, "business column") for col in spec.business_columns
+        ]
 
         query = (
             f"SELECT {', '.join(columns)} "
@@ -267,9 +393,45 @@ class MSSQLConnector:
         if arrow_table.num_rows == 0:
             return None
 
+        return DataFrame(
+            conform(arrow_table, event_schema(spec), f"{spec.capture_instance} events")
+        )
 
+    def to_events(
+        self, rows: DataFrame, spec: TableSpec, commit_timestamp: datetime | None
+    ) -> DataFrame:
+        """Stamp a chunk of table rows with the log's own columns.
 
-        return DataFrame(arrow_table)
+        What makes a dump run yield one schema instead of two: a chunk arrives with
+        the table's columns only, and comes out of here shaped like an event.
+
+        The LSN columns are all zeros, which is a position CDC never issues. It marks
+        the row as read off the table rather than out of the log — legible to anyone
+        auditing the output — and it gives the right precedence for nothing: ordering
+        by ``(start_lsn, seqval)`` puts every dump row below every real event, which
+        is the base-image-then-changes relationship the merge already enforces.
+
+        Args:
+            rows: A chunk of table rows, conforming to the spec's row schema.
+            spec: Table metadata.
+            commit_timestamp: Commit time of the window bracketing the chunk read, or
+                None when the log records none for it.
+
+        Returns:
+            The same rows, in the event schema.
+        """
+        stamped = rows.select(
+            lit(bytes(LSN_WIDTH), Binary).alias("start_lsn"),
+            lit(bytes(LSN_WIDTH), Binary).alias("seqval"),
+            lit(OP_DUMP, Int32).alias("operation"),
+            lit(bytes(_mask_width(spec)), Binary).alias("update_mask"),
+            lit(commit_timestamp, Datetime("us")).alias("commit_timestamp"),
+            all(),
+        )
+
+        logger.debug(f"stamped {stamped.height} dump rows as events")
+
+        return stamped
 
 
     def map_lsn_to_timestamp(self, lsn: LSN) -> datetime | None:
@@ -296,6 +458,21 @@ class MSSQLConnector:
 
         if not spec.business_columns:
             raise ValueError(f"{spec.qualified_name} has no business columns to read")
+
+    def _project(self, column: ColumnSpec) -> str:
+        """How a column is named in a table read's SELECT list.
+
+        A computed column is projected as NULL rather than read. SQL Server computes
+        it on the way out of the table but records nothing for it in the change log,
+        so reading its value here would put the computed number on a dump row and a
+        null on every event for that same row — one schema carrying two answers, and
+        no way downstream to tell that from a real transition to null. Null on both
+        sides is the honest one, and ``computed_definition`` on the spec is what a
+        consumer recomputes from.
+        """
+        quoted = self._quote_identifier(column.name, "business column")
+
+        return f"NULL AS {quoted}" if column.is_computed else quoted
 
     def _build_read_table_query(
         self,
@@ -345,7 +522,7 @@ class MSSQLConnector:
 
         schema = self._quote_identifier(spec.source_schema, "schema")
         table = self._quote_identifier(spec.source_table, "table")
-        columns = [self._quote_identifier(col, "business column") for col in spec.business_columns]
+        columns = [self._project(column) for column in spec.captured_columns]
         order_by = [self._quote_identifier(col, "primary key column") for col in spec.pk_columns]
         leading = order_by[0]
 
@@ -423,8 +600,10 @@ class MSSQLConnector:
         # Unlike read_event_log, an empty range returns an empty DataFrame rather than
         # None: a key range with no rows in it is a legitimate answer, not an absent
         # result — sparse ranges are expected, since chunk_size is a key width and not
-        # a row count. Arrow keeps the result set schema even at zero rows.
-        return DataFrame(arrow_table)
+        # a row count. The declared schema survives zero rows either way.
+        return DataFrame(
+            conform(arrow_table, row_schema(spec), f"{spec.qualified_name} rows")
+        )
 
     def _build_pk_range_query(self, spec: TableSpec) -> str:
         """Build the T-SQL that reads the leading key's bounds.

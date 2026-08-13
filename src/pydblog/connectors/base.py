@@ -36,7 +36,29 @@ class SourceConnector(Protocol):
         """
         Read change data capture events for a table in the database.
 
+        Frames come back in the spec's event schema — the log's own columns ahead of
+        the table's, with dtypes settled by the metadata inspect() read rather than by
+        whatever this result set let the driver infer.
+
         Returns None when there is no event at all in the LSN range.
+        """
+        ...
+
+    def to_events(
+        self, rows: DataFrame, spec: TableSpec, commit_timestamp: datetime | None
+    ) -> DataFrame:
+        """
+        Stamp a chunk of table rows with the log's own columns.
+
+        This is what lets a dump run yield a single schema: rows read from the table
+        come out shaped like events, so a consumer can stack every frame of a run
+        without reconciling two layouts.
+
+        How a source marks a row as read from the table rather than the log is its own
+        business — the marker has to be a position the log itself never issues.
+
+        The commit_timestamp is the one the caller establishes for the window
+        bracketing the chunk read, and may be None when the log records none.
         """
         ...
 
@@ -55,6 +77,9 @@ class SourceConnector(Protocol):
 
         Pagination is by key value rather than by position, so a chunk plan computed
         once stays valid under concurrent writes.
+
+        Frames come back in the spec's row schema, with dtypes settled by the metadata
+        inspect() read rather than by this particular result set.
 
         The limit is an optional cap on rows read; 0 means uncapped.
         """
