@@ -620,6 +620,46 @@ def test_read_table_conforms_to_the_declared_schema(connector, spec):
 
 
 @pytest.mark.integration
+def test_a_rowversion_is_named_differently_by_the_table_and_the_log(spec):
+    """
+    The source table calls it 'timestamp'; the change table calls it 'binary', since
+    a change table cannot carry a rowversion of its own and CDC stores the eight
+    bytes as plain binary. Both names must map to the same Arrow type, or inspect()
+    reports drift on a table that has not drifted at all.
+    """
+    source = next(column for column in spec.columns if column.name == "row_version")
+    captured = next(
+        column for column in spec.captured_columns if column.name == "row_version"
+    )
+
+    assert (source.type_name, captured.type_name) == ("timestamp", "binary")
+
+
+@pytest.mark.integration
+def test_a_rowversion_reads_as_binary_not_a_time(connector, spec, change_window):
+    """
+    'timestamp' is SQL Server's name for a row version: 8 opaque bytes, monotonic,
+    with no relation to a clock. Typing it temporally would corrupt it outright — the
+    bytes are not an instant and casting them to one is meaningless.
+    """
+    rows = connector.read_table(spec)
+    events = connector.read_event_log(
+        spec, change_window["from_lsn"], change_window["to_lsn"]
+    )
+
+    assert rows.schema["row_version"] == Binary
+    assert events.schema["row_version"] == Binary
+
+
+@pytest.mark.integration
+def test_a_rowversion_keeps_its_eight_bytes(connector, spec):
+    """Binary of the wrong width would still be binary, and still be wrong."""
+    versions = connector.read_table(spec, limit=1)["row_version"].to_list()
+
+    assert [len(version) for version in versions] == [8]
+
+
+@pytest.mark.integration
 def test_read_table_types_a_computed_column_from_its_declaration(connector, spec):
     assert connector.read_table(spec).schema["total_amount"] == PlDecimal(
         precision=12, scale=2

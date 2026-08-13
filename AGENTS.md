@@ -43,6 +43,13 @@ evidence is in `adls/2026-08-13-1730-one-schema-per-run.md`.
   `cdc.<instance>_CT` via the same `sys.columns` query as the source table.
 - **`ALTER COLUMN` is propagated to the change table**; a **dropped** column is not.
   Only the latter produces drift `inspect()` can catch.
+- **SQL Server's `timestamp` is a `ROWVERSION`, not a time.** Eight opaque bytes. It
+  maps to binary, and `_FIXED` is checked before the temporal branch so it can never
+  fall through to `pa.timestamp`. Do not "fix" this.
+- **A rowversion is `timestamp` on the source and `binary` in the change table** — a
+  change table cannot have a rowversion of its own. This is why `validate()` compares
+  `arrow_type(...)` and not type names: comparing names rejects every table that has
+  one.
 - **`_last_lsn` is not a real log position.** It sits one past where the last window
   closed, so `fn_cdc_map_lsn_to_time` returns NULL for it. Chunks are dated from a
   `get_max_lsn()` taken at the top of each pass. That watermark is for dating only —

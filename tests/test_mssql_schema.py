@@ -65,7 +65,10 @@ TYPE_MAP: list[tuple[str, int, int, pa.DataType, DataType]] = [
     ("varbinary", 0, 0, pa.large_binary(), Binary),
     ("binary", 0, 0, pa.large_binary(), Binary),
     ("image", 0, 0, pa.large_binary(), Binary),
+    # A row version, not a time. SQL Server reports it as 'timestamp'; 'rowversion' is
+    # the spelling DDL accepts. Both are 8 opaque bytes and neither is temporal.
     ("timestamp", 0, 0, pa.large_binary(), Binary),
+    ("rowversion", 0, 0, pa.large_binary(), Binary),
     ("date", 10, 0, pa.date32(), Date),
     ("time", 16, 7, pa.time64("ns"), Time),
     ("time", 16, 3, pa.time64("us"), Time),
@@ -243,6 +246,33 @@ def test_validate_rejects_a_computed_primary_key() -> None:
 
     with pytest.raises(ValueError, match=r"primary key column 'sale_id'.*computed"):
         validate(spec(key, captured=[key]))
+
+
+def test_validate_accepts_a_rowversion_described_two_ways() -> None:
+    """
+    The source table calls it 'timestamp' and the change table 'binary' — a change
+    table cannot carry a rowversion of its own, so CDC stores the eight bytes as
+    plain binary. Two names, one type, and comparing the names calls it drift.
+    """
+    table = spec(
+        column("sale_id", "int"),
+        column("row_version", "timestamp", 0, 0),
+        captured=[column("sale_id", "int"), column("row_version", "binary", 0, 0)],
+    )
+
+    assert validate(table) is None
+
+
+def test_validate_still_rejects_types_that_only_look_alike() -> None:
+    """Guards the above: the loosening is to the Arrow type, not to anything wider."""
+    table = spec(
+        column("sale_id", "int"),
+        column("when", "datetime2", 27, 7),
+        captured=[column("sale_id", "int"), column("when", "datetime2", 27, 6)],
+    )
+
+    with pytest.raises(ValueError, match=r"'when' has drifted"):
+        validate(table)
 
 
 def test_validate_rejects_a_primary_key_the_log_does_not_carry() -> None:

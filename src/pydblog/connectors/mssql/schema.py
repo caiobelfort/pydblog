@@ -145,12 +145,17 @@ def validate(spec: TableSpec) -> None:
                 f"read cannot project"
             )
 
-        if origin != captured:
+        # Compared as Arrow types rather than by name, because the question is
+        # whether the two reads produce the same column, not whether SQL Server uses
+        # the same word for it. A rowversion is 'timestamp' on the source table and
+        # 'binary' in the change table — one type, two names, and no drift.
+        if arrow_type(origin) != arrow_type(captured):
             raise ValueError(
                 f"captured column {captured.name!r} has drifted: the change log "
                 f"records it as {_describe(captured)} and {spec.qualified_name} now "
-                f"has {_describe(origin)}. CDC keeps the type it captured, so the two "
-                f"reads would return different schemas for the same column."
+                f"has {_describe(origin)}, which do not read back as the same type. "
+                f"CDC keeps the type it captured, so the two reads would return "
+                f"different schemas for the same column."
             )
 
     business = spec.business_columns

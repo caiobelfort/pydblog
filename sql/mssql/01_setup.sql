@@ -43,7 +43,11 @@ BEGIN
         status        NVARCHAR(20)    NOT NULL DEFAULT N'PENDING',  -- PENDING | COMPLETED | CANCELLED
         sale_date     DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
         created_at    DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
-        updated_at    DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+        updated_at    DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+        -- sys.types calls this 'timestamp', which is a row version and not a time at
+        -- all: 8 opaque bytes. It reads as binary on both paths, and the tests say so
+        -- against a real server rather than trusting the name.
+        row_version   ROWVERSION      NOT NULL
     );
 END
 GO

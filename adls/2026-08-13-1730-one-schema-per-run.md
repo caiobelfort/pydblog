@@ -105,6 +105,32 @@ propagated to the change table, so it produces no drift to catch. A **dropped** 
 is not — it stays in the change table while the source loses it. That is the case the
 `dbo.pydblog_drift` fixture exercises.
 
+### 7. Drift is compared as Arrow types, not as type names
+
+The question reconciliation asks is whether the two reads produce the same column,
+not whether SQL Server uses the same word for it. `validate()` therefore compares
+`arrow_type(source) != arrow_type(captured)`.
+
+**Measured.** A `ROWVERSION` column is reported as two different types by the two
+sides:
+
+```
+captured column 'row_version' has drifted: the change log records it as
+binary(0,0) and dbo.sales now has timestamp(0,0)
+```
+
+A change table cannot carry a rowversion of its own — the value is generated per
+table — so CDC stores the eight bytes as plain `binary`, while `sys.types` calls the
+source column `timestamp`. Comparing names rejected every table with a rowversion
+column outright. Comparing Arrow types accepts it, because both map to
+`large_binary()`, and still rejects `datetime2(6)` against `datetime2(7)`, which map
+to `timestamp("us")` and `timestamp("ns")`.
+
+Note the trap in the name: SQL Server's `timestamp` **is** `rowversion` and has
+nothing to do with a clock. It maps to binary in `_FIXED`, which `arrow_type` checks
+before the temporal branch, and `_TIMESTAMPS` deliberately excludes it. Typing those
+bytes as an instant would corrupt them outright.
+
 ## Consequences
 
 - `pl.concat(dblog.run(...))` works vertically. Proven end to end in
