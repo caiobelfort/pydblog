@@ -53,9 +53,9 @@ CDC_METADATA_COLUMNS = [
 ]
 
 
-def make_connector() -> MSSQLConnector:
+def make_connector(**kwargs) -> MSSQLConnector:
     return MSSQLConnector(
-        host="localhost", port="1433", user="u", password="p", database="d"
+        host="localhost", port="1433", user="u", password="p", database="d", **kwargs
     )
 
 
@@ -135,6 +135,25 @@ def test_kwargs_override_connection_options():
     )
 
 
+def test_pagination_defaults_to_fetch():
+    assert make_connector()._pagination == "fetch"
+
+
+def test_pagination_can_be_set_to_top():
+    """
+    An alternative to OFFSET/FETCH NEXT for the row-count cap on a table read.
+    Still keyset pagination underneath — _next_chunk keeps computing start_pk from
+    the last row's leading key — only the SQL that enforces the row cap changes.
+    """
+    assert make_connector(pagination="top")._pagination == "top"
+
+
+@pytest.mark.parametrize("pagination", ["fetch_next", "offset", "TOP", ""])
+def test_rejects_an_unknown_pagination_style(pagination):
+    with pytest.raises(ValueError, match="pagination"):
+        make_connector(pagination=pagination)
+
+
 # ---------------------------------------------------------------------------
 # read_event_log — input validation, also needs no database
 # ---------------------------------------------------------------------------
@@ -178,18 +197,25 @@ def test_read_event_log_rejects_unsafe_capture_instance(capture_instance):
 
 
 def build_query(
-    start_pk: int | None = None, end_pk: int | None = None, limit: int = 0, **overrides
+    start_pk: int | None = None,
+    end_pk: int | None = None,
+    limit: int = 0,
+    pagination: str = "fetch",
+    **overrides,
 ) -> str:
-    query, _ = make_connector()._build_read_table_query(
+    query, _ = make_connector(pagination=pagination)._build_read_table_query(
         make_read_spec(**overrides), start_pk, end_pk, limit
     )
     return query
 
 
 def build_params(
-    start_pk: int | None = None, end_pk: int | None = None, limit: int = 0
+    start_pk: int | None = None,
+    end_pk: int | None = None,
+    limit: int = 0,
+    pagination: str = "fetch",
 ) -> list[int]:
-    _, params = make_connector()._build_read_table_query(
+    _, params = make_connector(pagination=pagination)._build_read_table_query(
         make_read_spec(), start_pk, end_pk, limit
     )
     return params
@@ -264,6 +290,40 @@ def test_build_read_table_query_without_bounds_omits_the_where_clause():
     )
     assert "WHERE" not in query
     assert build_params() == []
+
+
+def test_build_read_table_query_with_top_pagination_and_both_bounds():
+    """
+    TOP goes right after SELECT, so its placeholder is bound first — the bind order
+    always follows where the ``?`` lands in the text, not which clause it belongs to.
+    """
+    assert build_query(start_pk=10, end_pk=20, limit=5, pagination="top") == (
+        "SELECT TOP (?) [sale_id], [product_id], [unit_price] "
+        "FROM [dbo].[sales] "
+        "WHERE [sale_id] >= ? AND [sale_id] < ? "
+        "ORDER BY [sale_id]"
+    )
+    assert build_params(start_pk=10, end_pk=20, limit=5, pagination="top") == [5, 10, 20]
+
+
+def test_build_read_table_query_with_top_pagination_and_no_bounds():
+    assert build_query(limit=5, pagination="top") == (
+        "SELECT TOP (?) [sale_id], [product_id], [unit_price] "
+        "FROM [dbo].[sales] "
+        "ORDER BY [sale_id]"
+    )
+
+
+def test_build_read_table_query_with_top_pagination_uncapped_omits_top():
+    """limit=0 means uncapped for TOP the same way it does for FETCH NEXT."""
+    query = build_query(pagination="top")
+
+    assert "TOP" not in query
+    assert query == (
+        "SELECT [sale_id], [product_id], [unit_price] "
+        "FROM [dbo].[sales] "
+        "ORDER BY [sale_id]"
+    )
 
 
 def test_build_read_table_query_lower_bound_is_inclusive_and_upper_exclusive():

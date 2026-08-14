@@ -51,6 +51,11 @@ class MSSQLConnector:
         self._watermark_poll = float(
             kwargs.get("watermark_poll", WATERMARK_POLL_SECONDS)
         )
+        self._pagination = kwargs.get("pagination", "fetch")
+        if self._pagination not in ("fetch", "top"):
+            raise ValueError(
+                f"pagination must be 'fetch' or 'top', got {self._pagination!r}"
+            )
 
         # Identifiers (schema, table, column, capture instance) go into the query by
         # interpolation — the driver cannot bind an object name. This regex is the barrier.
@@ -621,8 +626,14 @@ class MSSQLConnector:
         order_by = [self._quote_identifier(col, "primary key column") for col in spec.pk_columns]
         leading = order_by[0]
 
-        clauses = [f"SELECT {', '.join(columns)}", f"FROM {schema}.{table}"]
+        select = f"SELECT TOP (?) {', '.join(columns)}" if (
+            limit > 0 and self._pagination == "top"
+        ) else f"SELECT {', '.join(columns)}"
+        clauses = [select, f"FROM {schema}.{table}"]
         params: list[int] = []
+
+        if limit > 0 and self._pagination == "top":
+            params.append(limit)
 
         # Both predicates are plain comparisons on the leading key column, so the
         # optimizer gets a clean seek on the clustered primary key index.
@@ -639,8 +650,9 @@ class MSSQLConnector:
         clauses.append(f"ORDER BY {', '.join(order_by)}")
 
         # T-SQL requires OFFSET before FETCH, and rejects FETCH NEXT 0 ROWS ONLY, so an
-        # uncapped read drops the whole pair rather than passing zero.
-        if limit > 0:
+        # uncapped read drops the clause rather than passing zero. TOP takes the same
+        # cap earlier, right after SELECT, since T-SQL requires it there.
+        if limit > 0 and self._pagination == "fetch":
             clauses.append("OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY")
             params.append(limit)
 
