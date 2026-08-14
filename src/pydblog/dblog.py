@@ -3,12 +3,13 @@ The DBLog algorithm, driven over a ``SourceConnector``.
 
 ``DBLog`` owns the algorithm; the connector owns the database. The attribute holding
 the connector is typed as the Protocol rather than as any concrete class, so the
-algorithm can only ever reach for the ten primitives every source must provide — a
-second source type needs no change here.
+algorithm can only ever reach for the primitives every source must provide — a second
+source type needs no change here.
 """
 
 import logging
 from collections.abc import Generator
+from datetime import datetime
 from types import TracebackType
 
 from polars import DataFrame
@@ -107,7 +108,6 @@ class DBLog:
         self._last_lsn: LSN | None = None  # log position reached; next window opens here
         self._chunk_key: int | None = None  # leading PK the next chunk starts at
         self._dump_done: bool = False  # set once a chunk comes back short
-        self._window_low: LSN | None = None  # log position the current chunk is dated from
 
     @property
     def last_lsn(self) -> LSN | None:
@@ -309,26 +309,20 @@ class DBLog:
 
         if dump is not None and not self._dump_done:
             while not self._dump_done:
-                # The watermark this pass dates its chunk from, taken before the scan
-                # starts. It is only ever used for that: the window still opens at
-                # _last_lsn, and opening it here instead would skip everything
-                # committed between where the last window closed and this moment.
-                self._window_low = self._connector.get_max_lsn()
-
-                # Order is the algorithm. _last_lsn already sits where the previous
-                # window closed, which is a position the log had reached before this
-                # scan began; the window then closes at the max LSN once the scan is
-                # done. Anything committed while the chunk was being read therefore
-                # falls inside the window, and the chunk cannot carry a stale row the
-                # window does not also correct.
+                # The window may only close once the log consumer has passed the high
+                # watermark, or a row changed during the scan can be missing from it.
+                low = self._connector.watermark()
                 chunk = self._next_chunk()
+                high = self._connector.watermark()
+                self._connector.await_watermark(high)
+
                 window = self._read_window()
 
                 if window is not None:
                     yield window
 
                 if chunk is not None:
-                    merged = self._merge_chunk(chunk, window)
+                    merged = self._merge_chunk(chunk, window, low)
                     if not merged.is_empty():
                         yield merged
 
@@ -390,7 +384,9 @@ class DBLog:
 
         return merged
 
-    def _merge_chunk(self, chunk: DataFrame, window: DataFrame | None) -> DataFrame:
+    def _merge_chunk(
+        self, chunk: DataFrame, window: DataFrame | None, low: datetime
+    ) -> DataFrame:
         """
         Drop what the window supersedes, then stamp what is left into an event.
 
@@ -398,14 +394,11 @@ class DBLog:
         produces ends up with the same columns as the frame a window produces, so a
         consumer can stack every frame of the run without reconciling two layouts.
 
-        The commit time comes from the watermark taken before the chunk was read.
-        Anything committed after it that touches a chunk row falls inside the window
-        and supersedes it, so no row that survives here is older than that watermark —
-        which is what makes it the honest claim rather than merely a convenient one.
-
         Args:
             chunk: Rows read from the table.
             window: Events from the log window bracketing that read, or None.
+            low: The watermark taken before the chunk was read; dates the emitted
+                rows, none of which can be older than it.
 
         Returns:
             The surviving rows, in the event schema.
@@ -414,13 +407,11 @@ class DBLog:
             RuntimeError: If the run state has not been seeded yet.
         """
 
-        if self._spec is None or self._window_low is None:
-            raise RuntimeError("run not started: no window to date the chunk against")
+        if self._spec is None:
+            raise RuntimeError("run not started: no primary key to merge on")
 
         return self._connector.to_events(
-            self._supersede(chunk, window),
-            self._spec,
-            self._connector.map_lsn_to_timestamp(self._window_low),
+            self._supersede(chunk, window), self._spec, low
         )
 
     def _next_chunk(self) -> DataFrame | None:

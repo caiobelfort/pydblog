@@ -13,7 +13,7 @@ DataFrame. Hence most of this is integration, against an ephemeral SQL Server th
 tests bring up through testcontainers (see ``conftest.py``).
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -470,6 +470,58 @@ def test_get_max_lsn_returns_an_lsn(connector):
     max_lsn = connector.get_max_lsn()
     assert isinstance(max_lsn, bytes)
     assert len(max_lsn) == 10
+
+
+@pytest.mark.integration
+def test_watermark_comes_from_the_sources_clock(connector):
+    """
+    The source's clock, not the client's. A watermark is compared against times the
+    server records for its own capture scans, and two machines' clocks do not agree.
+    """
+    mark = connector.watermark()
+
+    assert isinstance(mark, datetime)
+
+
+@pytest.mark.integration
+def test_watermarks_advance(connector):
+    first = connector.watermark()
+    second = connector.watermark()
+
+    assert second >= first
+
+
+@pytest.mark.integration
+def test_await_watermark_returns_once_capture_has_passed_it(connector, spec):
+    """
+    The barrier. A capture scan that starts after a watermark has, by the time it
+    finishes, processed everything committed before that watermark — the job scans
+    the log forward in commit order. This is what a written watermark buys in the
+    paper, without the write.
+    """
+    execute(
+        connector,
+        f"UPDATE {LAB_SCHEMA}.{LAB_TABLE} SET status = ? WHERE sale_id = "
+        f"(SELECT MIN(sale_id) FROM {LAB_SCHEMA}.{LAB_TABLE})",
+        ["AWAIT-WATERMARK"],
+    )
+    before = connector.get_max_lsn()
+    mark = connector.watermark()
+
+    connector.await_watermark(mark)
+
+    assert connector.get_max_lsn() > before
+
+
+@pytest.mark.integration
+def test_await_watermark_gives_up_rather_than_blocking_forever(connector, monkeypatch):
+    """A stopped capture job must surface as an error, not as a hung dump."""
+    # Connector state, not a call argument — a real caller sets this at construction.
+    monkeypatch.setattr(connector, "_watermark_timeout", 2.0)
+    unreachable = connector.watermark() + timedelta(hours=1)
+
+    with pytest.raises(TimeoutError, match="capture"):
+        connector.await_watermark(unreachable)
 
 
 @pytest.mark.integration

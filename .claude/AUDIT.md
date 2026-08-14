@@ -18,16 +18,6 @@ Python floor 3.12.
 
 Worth stating plainly, because most of it is load-bearing and easy to break later.
 
-**The watermark substitution is sound.** The paper brackets each chunk with a low and
-a high watermark *written* to the source (§IV-C). This implementation writes nothing:
-it takes `_last_lsn` — where the previous window closed, a position the log had
-reached before this scan began — as the low bound, and `sys.fn_cdc_get_max_lsn()`
-*after* the scan returns as the high bound (`dblog.py:273-274`). Since the capture job
-lags real commits, that high bound is at or past anything committed during the scan,
-so the window is a **superset** of the paper's ambiguity window. Over-inclusion costs
-re-delivery and nothing else. The ordering is asserted directly rather than inferred
-from results (`test_dblog.py:764`), which is the right thing to pin.
-
 **No locks, no writes to the source.** The paper's chief claim is that a dump needs
 neither (§I). Nothing here takes a lock, opens a transaction, or needs INSERT anywhere.
 A least-privilege reader suffices.
@@ -53,6 +43,80 @@ re-delivered rather than one chunk lost.
 ---
 
 ## High
+
+**F0 — A chunk could emit a stale row, and the run never corrected it. FIXED.**
+*Supersedes an earlier claim in this document that the watermark substitution was
+sound. That claim was wrong, and measured to be wrong — see below.*
+
+*Resolved by bracketing each chunk with real watermarks.* `run()` now takes a
+watermark before the scan and one after, waits for the source's log consumer to pass
+the second (`await_watermark`), and only then closes the window — the paper's
+structure, with a timestamp standing in for the written watermark row. The stale row
+no longer escapes, pinned by
+`test_a_write_during_a_chunk_scan_does_not_escape_as_a_stale_row`. Costs one capture
+polling interval per chunk, 5s by default. The rest of this finding is kept because
+the reasoning is what the fix rests on.
+
+The paper brackets each chunk with a low and a high watermark *written* to the source
+(§IV-C), and waits until the high watermark is observed before emitting the chunk.
+This implementation writes nothing: the reconciliation window in `_supersede`
+(`dblog.py:347-391`) is `(_last_lsn, high]`, with `high = sys.fn_cdc_get_max_lsn()`
+read after the scan.
+
+The earlier reasoning here was that "since the capture job lags real commits, that
+high bound is at or past anything committed during the scan." That is a non-sequitur:
+lagging means the bound is *behind* recent commits, not ahead of them.
+`fn_cdc_get_max_lsn()` reports what the **capture job has processed**, not what has
+committed, and the capture job polls (5s by default).
+
+*Measured, 2026-08-14, against the lab container:*
+
+- Commit an UPDATE, then read `get_max_lsn()` immediately: **5 attempts out of 5**, the
+  value had not moved at all, and the change's real LSN was strictly greater. A window
+  closed at that bound misses the change every time, not occasionally.
+- Injecting an UPDATE between the chunk read and the window read — exactly the interval
+  the paper's high watermark covers — the dump emitted the **pre-update** value and
+  nothing later in that run corrected it.
+
+So on the high side the window is a **subset** of the paper's ambiguity window, not a
+superset. What saves the data is not the window but the ordering: dump rows carry an
+all-zero LSN and so sort below every real event.
+
+*Not data loss.* The correction is delivered by the **next** run, resuming from the
+recorded `last_lsn` — verified in the same measurement. The guarantee is therefore
+weaker than the paper's, and precisely so:
+
+| | guarantee |
+| --- | --- |
+| Paper | An emitted chunk never contains a stale row. |
+| Here | A chunk may contain a stale row; a later *run* corrects it. |
+
+Fine for a consumer that keeps tailing and applies in order. Wrong for one that treats
+a single completed `run()` as a self-consistent snapshot, or that dedupes by key
+keeping the first occurrence.
+
+*Closable without writing to the source.* The paper writes watermarks in order to
+*observe* them later — the write is a synchronisation barrier, not a marker. SQL
+Server exposes the same barrier read-only, so the paper's guarantee is reachable
+without forfeiting the read-only property below. Measured the same day:
+
+- `sys.dm_db_log_stats(DB_ID()).log_end_lsn` is the true end of log, in the same LSN
+  space as CDC's `binary(10)` (`CONVERT(BINARY(10), '0x' + REPLACE(log_end_lsn, ':',
+  ''), 1)`). **It does not work as a barrier target**: `get_max_lsn()` tracks the last
+  CDC-relevant transaction while `log_end_lsn` counts every log record, so it
+  converges close and never crosses — 60s of polling, never met.
+- `sys.dm_cdc_log_scan_sessions.end_lsn` is the same signal as `get_max_lsn()`, and is
+  **zeroed on empty scans**, so it is no better.
+- **What does work is time.** Wait until that DMV shows a *completed* scan whose
+  `start_time` is later than the moment the chunk SELECT finished. The capture job
+  scans the log in commit order, so such a scan has necessarily processed everything
+  committed before then. Verified 3/3: after the barrier, `get_max_lsn()` was *exactly
+  equal* to the LSN of a change committed before it. Wait was 4.8s, 5.0s, 5.0s —
+  the capture job's polling interval.
+
+So closing F0 costs a `VIEW DATABASE STATE` grant and ~5s of wall clock per chunk
+(over an hour on a 1000-chunk dump, and tunable via the capture job's polling
+interval), rather than a watermark table and write permission.
 
 **F1 — A primary-key-changing UPDATE orphans a row, permanently.**
 `read_event_log` reads in `N'all'` mode (`mssql.py:249`), which returns after-images

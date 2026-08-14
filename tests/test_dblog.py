@@ -11,7 +11,7 @@ job, and it is already answered there.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from polars import Binary, DataFrame, Datetime, Int32, all, lit
@@ -80,7 +80,8 @@ class StubConnector:
         self.event_log_calls: list[tuple[TableSpec, LSN, LSN]] = []
         self.read_table_calls: list[tuple[TableSpec, int | None, int | None, int]] = []
         self.inspect_calls: list[tuple[str, str]] = []
-        self.map_lsn_calls: list[LSN] = []
+        self.watermarks: list[datetime] = []
+        self.awaited: list[datetime] = []
         self.to_events_calls: list[tuple[DataFrame, datetime | None]] = []
         # Every read in the order it happened. The interleave is as much about
         # sequence as about results: the window has to close after the chunk scan.
@@ -129,9 +130,20 @@ class StubConnector:
     def read_pk_range(self, spec: TableSpec) -> tuple[int, int] | None:
         return None
 
-    def map_lsn_to_timestamp(self, value: LSN) -> datetime | None:
-        self.map_lsn_calls.append(value)
-        return COMMIT_TIME
+    def watermark(self) -> datetime:
+        """A distinct, increasing value per call, so tests can tell them apart.
+
+        Deliberately offset from ``COMMIT_TIME``: a stamp that happened to equal it
+        would let a test pass without the watermark having reached the frame at all.
+        """
+        self.calls.append("watermark")
+        mark = COMMIT_TIME + timedelta(seconds=1 + len(self.watermarks))
+        self.watermarks.append(mark)
+        return mark
+
+    def await_watermark(self, mark: datetime) -> None:
+        self.calls.append("await_watermark")
+        self.awaited.append(mark)
 
     def to_events(
         self, rows: DataFrame, spec: TableSpec, commit_timestamp: datetime | None
@@ -891,7 +903,13 @@ def test_closes_the_window_after_the_chunk_it_brackets(factory_calls):
 
     full_run(dblog, from_lsn=lsn(10))
 
-    assert dblog._connector.calls[:4] == [
+    reads = [
+        call
+        for call in dblog._connector.calls
+        if call in ("read_table", "read_event_log")
+    ]
+
+    assert reads[:4] == [
         "read_table",
         "read_event_log",
         "read_table",
@@ -945,14 +963,11 @@ def test_chunk_frames_are_stamped_even_when_the_window_was_empty(factory_calls):
     assert frames[0]["operation"].to_list() == [0, 0]
 
 
-def test_chunk_frames_are_dated_from_the_watermark_before_the_chunk(factory_calls):
+def test_a_chunk_is_bracketed_by_two_watermarks(factory_calls):
     """
-    A chunk pass takes two watermarks, one before the read and one after, and the
-    chunk is dated from the one before: every change committed after it lands inside
-    the window and supersedes the chunk, so no surviving row is older than it.
-
-    lsn(200) is the max before the chunk, lsn(300) the max after. Dating from the
-    latter would claim the rows are current as of a moment they were not read at.
+    The algorithm, in the order it has to happen: a watermark, the chunk scan, a
+    second watermark, then the wait that makes the second one mean something. Only
+    then may the window close.
     """
     dblog = dumping(factory_calls, chunk_size=2)
     dblog._connector.row_script = [sales(1, 2)]
@@ -960,32 +975,40 @@ def test_chunk_frames_are_dated_from_the_watermark_before_the_chunk(factory_call
 
     full_run(dblog, from_lsn=lsn(10))
 
-    assert dblog._connector.map_lsn_calls == [lsn(200)]
+    assert dblog._connector.calls[:5] == [
+        "watermark",
+        "read_table",
+        "watermark",
+        "await_watermark",
+        "read_event_log",
+    ]
 
 
-def test_the_chunk_watermark_is_a_position_the_log_actually_reached(factory_calls):
-    """
-    Not _last_lsn. That sits one past where the previous window closed, which is a
-    position nothing ever committed at — CDC records no time for it, so dating from
-    it leaves every chunk after the first with no timestamp at all.
-    """
+def test_the_chunk_is_awaited_on_the_watermark_taken_after_it(factory_calls):
+    """The one before the scan cannot prove the scan's own changes were captured."""
+    # One row, one pass, one pair of watermarks.
     dblog = dumping(factory_calls, chunk_size=2)
-    dblog._connector.row_script = [sales(1, 2), sales(3)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400), lsn(500)]
+    dblog._connector.row_script = [sales(1)]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
 
     full_run(dblog, from_lsn=lsn(10))
 
-    assert dblog._connector.map_lsn_calls == [lsn(200), lsn(400)]
+    taken, awaited = dblog._connector.watermarks, dblog._connector.awaited
+
+    assert awaited == [taken[1]]
 
 
-def test_the_stamped_commit_time_reaches_the_frame(factory_calls):
+def test_chunk_frames_are_dated_from_the_watermark_before_the_chunk(factory_calls):
+    """Dated from the low watermark, not the high — that one is taken after the read."""
     dblog = dumping(factory_calls, chunk_size=2)
     dblog._connector.row_script = [sales(1, 2)]
     dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
 
     frames = full_run(dblog, from_lsn=lsn(10))
 
-    assert frames[0]["commit_timestamp"].to_list() == [COMMIT_TIME] * 2
+    assert frames[0]["commit_timestamp"].to_list() == [
+        dblog._connector.watermarks[0]
+    ] * 2
 
 
 def test_a_chunk_wholly_superseded_is_not_emitted(factory_calls):

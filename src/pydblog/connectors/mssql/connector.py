@@ -2,6 +2,7 @@ import logging
 import re
 from datetime import datetime
 from math import ceil
+from time import monotonic, sleep
 
 import mssql_python
 from polars import Binary, DataFrame, Datetime, Int32, all, lit
@@ -22,6 +23,9 @@ OP_UPDATE_AFTER = 4
 # order and comparing LSNs as plain bytes works.
 LSN_WIDTH = 10
 
+WATERMARK_TIMEOUT_SECONDS = 120.0
+WATERMARK_POLL_SECONDS = 1.0
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,6 +45,12 @@ class MSSQLConnector:
         self._encrypt: str = kwargs.get("encrypt", "yes")
         self._trust_server_certificate: str = kwargs.get("trust_server_certificate", "yes")
         self._application_name: str = kwargs.get("application_name", "Lakehouse DBLog")
+        self._watermark_timeout = float(
+            kwargs.get("watermark_timeout", WATERMARK_TIMEOUT_SECONDS)
+        )
+        self._watermark_poll = float(
+            kwargs.get("watermark_poll", WATERMARK_POLL_SECONDS)
+        )
 
         # Identifiers (schema, table, column, capture instance) go into the query by
         # interpolation — the driver cannot bind an object name. This regex is the barrier.
@@ -433,6 +443,81 @@ class MSSQLConnector:
 
         return stamped
 
+    def watermark(self) -> datetime:
+        """Take a watermark from the source's own clock.
+
+        Read from the source rather than the client: it is compared against times
+        SQL Server recorded for its own capture scans.
+
+        Returns:
+            The source's current time.
+        """
+        cur = self._cursor()
+        cur.execute("SELECT SYSDATETIME()")
+        row = cur.fetchone()
+        cur.close()
+
+        if row is None or row[0] is None:
+            raise RuntimeError("the source returned no time for a watermark")
+
+        return row[0]
+
+    def await_watermark(self, mark: datetime) -> None:
+        """Block until the capture job has processed everything committed by ``mark``.
+
+        ``fn_cdc_get_max_lsn()`` reports how far the capture job has read, not how far
+        the database has committed, so a window bounded by it can miss a change made
+        during the chunk scan. This blocks until ``_capture_passed`` confirms the
+        capture job has caught up past ``mark``.
+
+        Costs one capture polling interval (5s by default); ``watermark_timeout`` and
+        ``watermark_poll`` on the constructor tune it for a different polling rate.
+
+        Args:
+            mark: A watermark from ``watermark()``.
+
+        Raises:
+            TimeoutError: If the capture job did not pass ``mark`` in time — normally
+                meaning it is not running.
+        """
+        deadline = monotonic() + self._watermark_timeout
+        cur = self._cursor()
+
+        try:
+            while monotonic() < deadline:
+                if self._capture_passed(cur, mark):
+                    logger.debug(f"capture passed the watermark {mark.isoformat()}")
+                    return
+
+                sleep(self._watermark_poll)
+        finally:
+            cur.close()
+
+        raise TimeoutError(
+            f"the capture job did not pass the watermark {mark.isoformat()} within "
+            f"{self._watermark_timeout}s; is the SQL Server Agent running and the "
+            f"capture job started?"
+        )
+
+    def _capture_passed(self, cur: mssql_python.Cursor, mark: datetime) -> bool:
+        """Whether the capture job has processed everything committed by ``mark``.
+
+        Either a scan started after ``mark`` (writing) or an empty one ended after it
+        (idle and caught up) — the second case matters because consecutive empty
+        scans reuse one session row, freezing ``start_time``, which is a dump's usual
+        state since it only reads.
+        """
+        cur.execute(
+            "SELECT TOP 1 CASE WHEN start_time > ? "
+            "    OR (empty_scan_count > 0 AND end_time > ?) THEN 1 ELSE 0 END "
+            "FROM sys.dm_cdc_log_scan_sessions "
+            "WHERE session_id > 0 "
+            "ORDER BY end_time DESC",
+            [mark, mark],
+        )
+        row = cur.fetchone()
+
+        return bool(row and row[0])
 
     def map_lsn_to_timestamp(self, lsn: LSN) -> datetime | None:
         cur = self._cursor()

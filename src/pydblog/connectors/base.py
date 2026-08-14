@@ -18,6 +18,26 @@ class SourceConnector(Protocol):
         "Fetch the lowest Log Sequence Number available for a table's events"
         ...
 
+    def watermark(self) -> datetime:
+        """
+        Take a watermark, to bracket a chunk read with.
+
+        Must come from the source's own clock, so it is comparable against the
+        source's own record of its progress.
+        """
+        ...
+
+    def await_watermark(self, mark: datetime) -> None:
+        """
+        Block until the log consumer has processed everything committed by a watermark.
+
+        The barrier the algorithm depends on: once this returns, a window closed
+        after ``mark`` cannot miss a change made while a chunk was being scanned.
+
+        Raises TimeoutError if the source's log consumer is not making progress.
+        """
+        ...
+
     def connect(self) -> None:
         "Open a connection to the database"
         ...
@@ -91,16 +111,6 @@ class SourceConnector(Protocol):
 
         Returns None when the table is empty. This is what the chunk plan is sliced
         out of, so the leading key column has to be an integer type.
-        """
-        ...
-
-    def map_lsn_to_timestamp(self, lsn: LSN) -> datetime | None:
-        """
-        Read the commit time recorded against an LSN.
-
-        Returns None when the LSN falls outside the range the log tracks, which is a
-        real answer rather than a failure: an LSN either has a recorded commit time
-        or it does not.
         """
         ...
 

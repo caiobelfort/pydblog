@@ -9,6 +9,8 @@ a decimal's scale or a null column's type. A consumer only found out at the conc
 with progress already checkpointed against the chunk that broke it.
 """
 
+from typing import NamedTuple
+
 import polars as pl
 import pytest
 from polars import DataFrame
@@ -24,6 +26,7 @@ from conftest import (
     SA_PASSWORD,
     execute,
     latest_change_lsn,
+    scalar,
     wait_for_cdc,
 )
 
@@ -163,6 +166,82 @@ def test_dump_rows_are_dated_in_the_order_the_chunks_were_read(dumped):
     ]
 
     assert dated == sorted(dated)
+
+
+class Raced(NamedTuple):
+    """What a run did to one row that changed while its chunk was being scanned."""
+
+    fired: bool
+    stale: str
+    rows: DataFrame
+
+
+@pytest.fixture(scope="module")
+def raced(dblog, connector, spec) -> Raced:
+    """
+    A dump run with a write landing inside a chunk scan.
+
+    ``_next_chunk`` and ``_read_window`` are adjacent in the loop, so wrapping
+    ``read_table`` drops the write exactly where the paper's high watermark has to
+    cover: after the rows were read, before the window closes. Without the barrier
+    this reproduced a stale row every time.
+    """
+    target = scalar(connector, f"SELECT MIN(sale_id) FROM {LAB_SCHEMA}.{LAB_TABLE}")
+    stale = scalar(
+        connector,
+        f"SELECT status FROM {LAB_SCHEMA}.{LAB_TABLE} WHERE sale_id = ?",
+        [target],
+    )
+
+    original = dblog._connector.read_table
+    fired: list[int] = []
+
+    def read_then_write(*args, **kwargs):
+        rows = original(*args, **kwargs)
+        if not fired and target in rows["sale_id"].to_list():
+            execute(
+                connector,
+                f"UPDATE {LAB_SCHEMA}.{LAB_TABLE} SET status = ? WHERE sale_id = ?",
+                ["RACED", target],
+            )
+            fired.append(target)
+        return rows
+
+    dblog._connector.read_table = read_then_write
+    try:
+        frames = list(dblog.run(LAB_SCHEMA, LAB_TABLE, dump="race-proof"))
+    finally:
+        dblog._connector.read_table = original
+
+    return Raced(
+        fired=bool(fired),
+        stale=stale,
+        rows=pl.concat(frames).filter(pl.col("sale_id") == target),
+    )
+
+
+@pytest.mark.integration
+def test_the_race_actually_happened(raced):
+    """Otherwise the assertions below prove nothing."""
+    assert raced.fired
+
+
+@pytest.mark.integration
+def test_a_write_during_a_chunk_scan_does_not_escape_as_a_stale_row(raced):
+    """
+    The property the watermarks exist for. The chunk read the row before the update
+    committed, so without the barrier it emitted the pre-update value and the run
+    never corrected it.
+    """
+    dump_rows = raced.rows.filter(pl.col("operation") == OP_DUMP)
+
+    assert raced.stale not in dump_rows["status"].to_list()
+
+
+@pytest.mark.integration
+def test_the_change_made_during_the_scan_is_in_the_run(raced):
+    """Dropped from the chunk, so the log has to be the one carrying it."""
+    assert "RACED" in raced.rows["status"].to_list()
 
 
 @pytest.mark.integration

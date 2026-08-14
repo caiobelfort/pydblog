@@ -81,6 +81,50 @@ tests avoid the filesystem.
 An `LSN` is `bytes` — 10 bytes, big-endian, so byte order is numeric order and plain
 comparison works.
 
+## Watermarks, and why a chunk pass is slow
+
+Each chunk is bracketed the way the paper brackets it (§IV-C), but with timestamps
+instead of writes:
+
+```
+low  = watermark()          # the source's clock, before the scan
+chunk = _next_chunk()
+high = watermark()          # after the scan
+await_watermark(high)       # ← the barrier; ~5s, and not optional
+window = _read_window()
+```
+
+**The wait is the algorithm, not an optimisation to remove.** `get_max_lsn()` reports
+how far the *capture job* has read, not how far the database has committed. Measured:
+a just-committed change was outside it **5 times out of 5** — the value had not moved
+at all. Closing a window on it let a row updated during a chunk scan be emitted with
+its pre-update value, uncorrected for the rest of the run. That is what
+`tests/test_dblog_integration.py::test_a_write_during_a_chunk_scan_does_not_escape_as_a_stale_row`
+pins.
+
+The paper writes to a watermark table so the write can be *observed* coming back out
+of the log. The write is not the point — waiting for it is — so a timestamp plus a
+way to ask "has the log consumer passed this?" does the same job with no write
+permission and no extra table.
+
+`await_watermark` accepts two signals, and needs both:
+
+- **`start_time` of a scan later than the mark** — the log consumer began a pass after
+  the watermark. This is the signal while the table is being written to.
+- **an *empty* scan ending after the mark** — the job read to the end of the log and
+  found nothing, so it is caught up. This is the signal while it is idle, which is a
+  dump's normal state since a dump only reads. Measured: consecutive empty scans reuse
+  one session row, so `start_time` **freezes** and only `end_time` moves. Waiting on
+  `start_time` alone hangs a dump.
+
+Two dead ends, both measured, so nobody re-treads them: `log_end_lsn` from
+`sys.dm_db_log_stats` never crosses `get_max_lsn()` (it counts every log record, while
+`get_max_lsn()` only moves for CDC transactions), and the scan session's `end_lsn` is
+the same value as `get_max_lsn()` and is zeroed on empty scans.
+
+Cost is one capture polling interval per chunk — 5s by default, tunable with
+`sp_cdc_change_job @pollinginterval`. A dump of N chunks pays roughly N × that.
+
 ## The invariant everything rests on
 
 **Every frame a run yields has the same schema.** Change events and dump rows alike.
