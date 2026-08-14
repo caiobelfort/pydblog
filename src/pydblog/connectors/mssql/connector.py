@@ -480,19 +480,29 @@ class MSSQLConnector:
             TimeoutError: If the capture job did not pass ``mark`` in time — normally
                 meaning it is not running.
         """
-        deadline = monotonic() + self._watermark_timeout
+        started = monotonic()
+        deadline = started + self._watermark_timeout
         cur = self._cursor()
+
+        logger.debug(f"waiting for capture to pass watermark {mark.isoformat()}")
 
         try:
             while monotonic() < deadline:
                 if self._capture_passed(cur, mark):
-                    logger.debug(f"capture passed the watermark {mark.isoformat()}")
+                    logger.info(
+                        f"capture passed watermark {mark.isoformat()} after "
+                        f"{monotonic() - started:.1f}s"
+                    )
                     return
 
                 sleep(self._watermark_poll)
         finally:
             cur.close()
 
+        logger.warning(
+            f"capture did not pass watermark {mark.isoformat()} within "
+            f"{self._watermark_timeout}s"
+        )
         raise TimeoutError(
             f"the capture job did not pass the watermark {mark.isoformat()} within "
             f"{self._watermark_timeout}s; is the SQL Server Agent running and the "
