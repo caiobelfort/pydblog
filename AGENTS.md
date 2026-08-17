@@ -5,8 +5,8 @@ what will bite you.
 
 ## What this is
 
-The DBLog algorithm over SQL Server CDC. `DBLog.run()` is a generator that interleaves
-a chunked table dump with the change log, yielding polars DataFrames.
+The DBLog algorithm over SQL Server CDC. `DBLog.run()` interleaves a chunked table dump
+with the change log, returning one polars DataFrame per call.
 
 `DBLog` owns the algorithm; the connector owns the database. `DBLog._connector` is
 typed as the `SourceConnector` Protocol, not as `MSSQLConnector`, so the algorithm can
@@ -45,14 +45,21 @@ Each is unremarkable alone; the shape only makes sense together.
 **The run loop** (`DBLog.run()`) is the algorithm, and its ordering is load-bearing:
 
 ```
-per chunk pass:
+one call, one batch:
+  seed once             # _start(): inspect + store read, skipped if the run matches
   _window_low = get_max_lsn()      # before-watermark, for dating this chunk only
   chunk  = _next_chunk()           # keyset page from _chunk_key
   window = _read_window()          # (_last_lsn, get_max_lsn()], then _last_lsn = high+1
-  yield _merge_chunk(chunk, window)  # one frame: window events, then _supersede
-                                     # (anti-join) + to_events (stamp) of the chunk
-                                     # caller calls commit() once that frame is written
+  return _merge_chunk(chunk, window)  # one frame: window events, then _supersede
+                                      # (anti-join) + to_events (stamp) of the chunk
+                                      # caller calls commit() once it has written it
 ```
+
+`run()` returns one frame, or None when the table is walked and the log is caught up.
+It is not a generator and holds nothing back: the read happens in the call. Past the
+end of the table a batch is a window alone, so a plain `while run() is not None` loop
+slides from dumping into tailing — `dump_done` is there for a caller that wants to
+stop at the end of the table instead.
 
 The window closes *after* the chunk scan, so anything committed during the scan lands
 inside it and the chunk cannot carry a stale row the window does not also correct.
@@ -133,9 +140,9 @@ Cost is one capture polling interval per chunk — 5s by default, tunable with
 
 ## The invariant everything rests on
 
-**Every frame a run yields has the same schema.** Change events and dump rows alike.
+**Every frame a run returns has the same schema.** Change events and dump rows alike.
 Break this and the failure surfaces at the consumer's `pl.concat`, long after the
-chunk that caused it was checkpointed.
+chunk that caused it was committed.
 
 It holds because:
 

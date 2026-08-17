@@ -3,9 +3,10 @@
 Streams a SQL Server table's changes, optionally interleaved with a chunked dump of
 its rows, using the [DBLog](https://arxiv.org/abs/2010.12597) algorithm over CDC.
 
-A run yields polars DataFrames. Every frame shares one schema — change events and
-dump rows alike — so no frame needs reconciling against another. You write each one
-and commit, and the commit is what a later run resumes from:
+One call reads one batch and returns it as a polars DataFrame, or None once there is
+nothing left to read. Every frame shares one schema — change events and dump rows
+alike — so no frame needs reconciling against another. You write each one and commit,
+and the commit is what a later run resumes from:
 
 ```python
 from pydblog.dblog import DBLog
@@ -16,28 +17,38 @@ with DBLog(
     user="sa", password="...", database="dblog_lab",
     chunk_size=1000,
 ) as dblog:
-    for frame in dblog.run("dbo", "sales", dump="sales-backfill"):
+    while (frame := dblog.run("dbo", "sales", dump="sales-backfill")) is not None:
         frame.write_delta("s3://lake/sales", mode="append")
-        dblog.commit()  # only now is that frame's position recorded
-
-    dblog.commit()  # once more, to record the dump as finished
+        dblog.commit()  # only now is that batch's position recorded
 ```
 
-Because every frame shares one schema, a whole run also stacks with
-`pl.concat(frames)` if you would rather collect it — but collecting first means
-nothing is durably written until the end, so commit once the write is done, not
-once the frames are in memory.
+Nothing is buffered and nothing is lazy: the batch is read by the call, and its size
+is bounded by `chunk_size` however large the table is. The first call inspects the
+table and loads whatever progress is recorded; the rest just advance.
+
+That loop runs until the table is walked *and* the log is caught up. To stop at the
+end of the table instead — a backfill rather than a tail — loop on `dump_done`:
+
+```python
+while not dblog.dump_done:
+    frame = dblog.run("dbo", "sales", dump="sales-backfill")
+    if frame is not None:
+        frame.write_delta("s3://lake/sales", mode="append")
+        dblog.commit()
+```
 
 Rows that came off the table rather than out of the log are marked with an all-zero
 `start_lsn` and `operation = 0`, a position CDC never issues.
 
 Naming a `dump` makes the run walk the table as well as the log, and gives `commit()`
 a name to record progress under, so an interrupted run resumes at the last chunk you
-committed. Leaving it out drains the change log only, and then requires a `from_lsn`.
+committed. Leaving it out reads the change log only, and then requires a `from_lsn`.
 
 `commit()` is yours to call because only you know when the data is safe. A frame you
 received but never committed is read again on the next run; a position recorded before
-your write succeeded would put those rows out of reach for good.
+your write succeeded would put those rows out of reach for good. Commit once more
+after the loop to record the dump as finished — the batch that discovers the end of
+the table is the one that comes back empty, so `done` has no frame to ride out on.
 
 ## Requirements
 

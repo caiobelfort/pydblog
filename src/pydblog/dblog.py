@@ -8,7 +8,6 @@ source type needs no change here.
 """
 
 import logging
-from collections.abc import Generator
 from datetime import datetime
 from types import TracebackType
 
@@ -42,8 +41,10 @@ class DBLog:
     window win over the chunk's rows, since they are the newer image. The result is a
     single stream where every row is delivered at least once and never stale.
 
-    Run state lives on the instance and only in memory: a run that dies restarts from
-    the beginning.
+    ``run`` hands back one batch per call, so the instance carries the run between
+    calls: where the table walk and the log have got to, and which table and dump they
+    belong to. That state is only in memory — what survives a process is whatever the
+    caller committed.
     """
 
     def __init__(
@@ -108,6 +109,9 @@ class DBLog:
         self._last_lsn: LSN | None = None  # log position reached; next window opens here
         self._chunk_key: int | None = None  # leading PK the next chunk starts at
         self._dump_done: bool = False  # set once a chunk comes back short
+        # What the seeded run is for, so run() can tell "next batch of the same run"
+        # from "a different run entirely" and only pay for seeding on the latter.
+        self._run: tuple[str, str, str | None] | None = None
 
     @property
     def last_lsn(self) -> LSN | None:
@@ -119,6 +123,25 @@ class DBLog:
         """
 
         return self._last_lsn
+
+    @property
+    def dump_done(self) -> bool:
+        """
+        Whether the table has been walked to the end.
+
+        False before a dump starts, and for a run that was never given a dump name.
+        Once it is True, further calls to ``run`` read the log alone — a batch is a
+        window and nothing more — so this is what a caller that wants the table and
+        not an open-ended tail loops on:
+
+        ```python
+        while not dblog.dump_done:
+            frame = dblog.run("dbo", "sales", dump="sales-backfill")
+            ...
+        ```
+        """
+
+        return self._dump_done
 
     def _start(
         self, schema: str, table: str, dump: str | None, from_lsn: LSN | None
@@ -266,42 +289,37 @@ class DBLog:
         table: str,
         dump: str | None = None,
         from_lsn: LSN | None = None,
-    ) -> Generator[DataFrame, None, None]:
+    ) -> DataFrame | None:
         """
-        Stream a table's changes, optionally interleaved with a dump of its rows.
+        Read the next batch of a table's changes, with a dump of its rows or without.
 
-        Naming a ``dump`` makes the run also walk the table in chunks, so a consumer
-        starting from nothing ends up with every row. The name is the dump's identity,
-        not a label: progress is recorded against it, so re-running under the same
-        name carries on where that dump stopped, and a new name starts over. Leaving
-        it unnamed drains the change log only, which is what a consumer that already
-        holds the table wants.
+        One call does one unit of work and hands back one frame; the caller loops for
+        the next. Nothing is buffered and nothing is lazy, so the memory a batch costs
+        is bounded by ``chunk_size`` however large the table is:
 
-        A dump run alternates the two: a chunk of rows, then the log window that
-        brackets reading it. Each iteration yields a single frame combining the
-        window's events with the chunk's rows, minus whatever the window supersedes,
-        window events ordered first. It ends when the table runs out.
+        ```python
+        while (frame := dblog.run("dbo", "sales", dump="sales-backfill")) is not None:
+            write(frame)
+            dblog.commit()
+        ```
 
-        A run records no progress by itself: the caller calls ``commit`` once it has
-        durably written what it was handed, and that is what a later run under the
-        same name resumes from. Frames received but never committed are read again,
-        so a run cut short by a lost connection — or by the caller's own write
-        failing — costs the uncommitted chunks and nothing more. A run whose frames
-        are never committed starts over from the beginning of the table.
-        Re-running a name whose table is done skips the chunks and tails the log
-        instead.
+        Naming a ``dump`` makes the run walk the table as well as the log, so a
+        consumer starting from nothing ends up with every row. The name is the dump's
+        identity, not a label: progress is recorded against it, so coming back under
+        the same name carries on where that dump stopped, and a new name starts over.
+        Leaving it unnamed reads the change log only, which is what a consumer that
+        already holds the table wants.
 
-        A run with no dump reads one window, from ``from_lsn`` to wherever the log's
-        end is at that moment, and stops — it does not loop internally until caught
-        up, since a table with a steady stream of writes would keep extending that
-        end and the run would never return. It has to be given a starting point:
-        ``from_lsn`` is required without a dump. A caller that wants to tail
-        continuously loops over ``run`` itself, handing ``last_lsn`` back in as
-        ``from_lsn`` each time; that outer loop is what naturally spaces out polls
-        against a source under heavy write load.
+        A dump batch is a chunk of rows plus the log window bracketing the read of it,
+        as one frame: the window's events first, then the chunk minus whatever those
+        events supersede. Once the table runs out, batches are windows alone.
 
-        This is a generator: nothing is read, and none of the errors below are
-        raised, until it is iterated.
+        The first call seeds the run — inspecting the table and loading whatever
+        progress is recorded — and later calls for the same ``schema``, ``table`` and
+        ``dump`` skip that and simply advance, so the metadata is read once rather
+        than once per batch. ``from_lsn`` is therefore honoured on the first call
+        only; passing different ones later has no effect. Calling with a different
+        table or dump name abandons the current run and seeds that one instead.
 
         Args:
             schema: Schema of the table to read.
@@ -309,15 +327,19 @@ class DBLog:
             dump: Identity of the dump to run or resume, or None to skip the dump.
             from_lsn: Where to open the first window. None means the present for a
                 dump starting fresh, and every event the log still holds for a run
-                with no dump. Ignored when the dump has progress recorded.
+                with no dump. Ignored when the dump has progress recorded, and on
+                every call after the first.
 
-        Yields:
-            Frames of change events in log order, and, on a dump run, frames of table
-            rows. Both carry the log's metadata columns ahead of the table's and share
-            one schema, so the whole run stacks into a single frame. Rows that came
-            off the table rather than out of the log are marked as such: their LSN
-            columns are all zeros, a position the log never issues, which also orders
-            them below every event.
+        Returns:
+            One frame of change events, of table rows, or of both, or None when there
+            was nothing to read: the table is walked and the log is caught up as of
+            this call. None is not permanent — a later call picks up whatever has
+            landed since — so it ends a loop rather than the run. Frames carry the
+            log's metadata columns ahead of the table's and all share one schema, so
+            successive batches stack without reconciling. Rows that came off the table
+            rather than out of the log are marked as such: their LSN columns are all
+            zeros, a position the log never issues, which also orders them below every
+            event.
 
         Raises:
             ValueError: If the table has no capture instance, if ``dump`` is blank, or
@@ -336,31 +358,30 @@ class DBLog:
                 "it, and neither is visible to the caller"
             )
 
-        self._start(schema, table, dump, from_lsn)
+        # Seeding is a metadata read and a store read, so it happens once for a run
+        # rather than once for every batch the caller asks for.
+        if self._run != (schema, table, dump):
+            self._start(schema, table, dump, from_lsn)
+            self._run = (schema, table, dump)
 
         if dump is not None and not self._dump_done:
-            while not self._dump_done:
-                # The window may only close once the log consumer has passed the high
-                # watermark, or a row changed during the scan can be missing from it.
-                low = self._connector.watermark()
-                chunk = self._next_chunk()
-                high = self._connector.watermark()
-                self._connector.await_watermark(high)
+            # The window may only close once the log consumer has passed the high
+            # watermark, or a row changed during the scan can be missing from it.
+            low = self._connector.watermark()
+            chunk = self._next_chunk()
+            high = self._connector.watermark()
+            self._connector.await_watermark(high)
 
-                window = self._read_window()
+            window = self._read_window()
 
-                if chunk is not None:
-                    merged = self._merge_chunk(chunk, window, low)
-                    if not merged.is_empty():
-                        yield merged
-                elif window is not None:
-                    yield window
+            # A chunk that came back empty ends the dump and leaves the window to
+            # stand as the batch on its own, if it held anything.
+            if chunk is not None:
+                return self._merge_chunk(chunk, window, low)
 
-            return
+            return window
 
-        events = self._read_window()
-        if events is not None:
-            yield events
+        return self._read_window()
 
     def _supersede(self, chunk: DataFrame, window: DataFrame | None) -> DataFrame:
         """

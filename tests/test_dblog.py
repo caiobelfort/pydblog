@@ -428,18 +428,61 @@ def test_refuses_to_read_a_window_before_the_run_state_is_seeded(
 # ---------------------------------------------------------------------------
 
 
-def drain(dblog: DBLog, **kwargs) -> list[DataFrame]:
-    """Run events-only to exhaustion. run() is lazy, so nothing happens until this."""
-    return list(dblog.run("dbo", "sales", **kwargs))
+def log_batch(dblog: DBLog, **kwargs) -> list[DataFrame]:
+    """
+    One events-only batch, which is all a call reads.
+
+    Returned as a list so a test can assert on a read that found nothing as easily as
+    on one that found events.
+    """
+    frame = dblog.run("dbo", "sales", **kwargs)
+    return [] if frame is None else [frame]
 
 
 def test_inspects_the_table_it_was_asked_for(factory_calls):
     dblog = DBLog(**CONNECTION)
 
-    drain(dblog, from_lsn=lsn(10))
+    log_batch(dblog, from_lsn=lsn(10))
 
     assert dblog._connector.inspect_calls == [("dbo", "sales")]
     assert dblog._spec == SPEC
+
+
+def test_seeds_the_run_once_however_many_batches_it_takes(factory_calls):
+    """Inspecting the table is a per-run cost, not a per-batch one."""
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2), sales(3, 4), sales(5)]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
+
+    frames = dump_only(dblog, from_lsn=lsn(10))
+
+    assert len(frames) == 3
+    assert dblog._connector.inspect_calls == [("dbo", "sales")]
+
+
+def test_a_different_dump_name_seeds_a_new_run(factory_calls):
+    """Asking for another dump abandons the one in progress rather than advancing it."""
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2), sales(3, 4)]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+
+    dblog.run("dbo", "sales", dump="first", from_lsn=lsn(10))
+    dblog.run("dbo", "sales", dump="second", from_lsn=lsn(10))
+
+    assert dblog._dump == "second"
+    assert dblog._connector.inspect_calls == [("dbo", "sales")] * 2
+    assert dblog._connector.read_table_calls[-1][1] is None  # started over
+
+
+def test_a_later_from_lsn_does_not_move_a_run_already_under_way(factory_calls):
+    """The position the run reached wins, or a batch would be replayed or skipped."""
+    dblog = DBLog(**CONNECTION)
+    dblog._connector.max_lsn_script = [lsn(100), lsn(200)]
+
+    dblog.run("dbo", "sales", from_lsn=lsn(10))
+    dblog.run("dbo", "sales", from_lsn=lsn(9_000))
+
+    assert dblog._connector.event_log_calls[-1][1] == lsn(101)
 
 
 def test_an_events_only_run_must_be_told_its_interval(factory_calls):
@@ -451,14 +494,14 @@ def test_an_events_only_run_must_be_told_its_interval(factory_calls):
     dblog = DBLog(**CONNECTION)
 
     with pytest.raises(ValueError, match="from_lsn"):
-        drain(dblog)
+        log_batch(dblog)
 
 
 def test_the_missing_interval_is_caught_before_the_source_is_touched(factory_calls):
     dblog = DBLog(**CONNECTION)
 
     with pytest.raises(ValueError):
-        drain(dblog)
+        log_batch(dblog)
 
     assert dblog._connector.inspect_calls == []
 
@@ -472,7 +515,7 @@ def test_the_floor_itself_is_readable(factory_calls):
     dblog._connector.min_lsn = lsn(40)
     dblog._connector.max_lsn = lsn(40)
 
-    drain(dblog, from_lsn=lsn(40))
+    log_batch(dblog, from_lsn=lsn(40))
 
     assert dblog._connector.event_log_calls == [(SPEC, lsn(40), lsn(40))]
 
@@ -541,7 +584,7 @@ def test_an_unnamed_run_reads_exactly_the_interval_it_was_given(factory_calls):
     dblog._connector.min_lsn = lsn(1)
     dblog._connector.max_lsn = lsn(100)
 
-    drain(dblog, from_lsn=lsn(7))
+    log_batch(dblog, from_lsn=lsn(7))
 
     assert dblog._connector.event_log_calls[0][1] == lsn(7)
 
@@ -551,7 +594,7 @@ def test_starts_where_the_caller_asked(factory_calls):
     dblog._connector.min_lsn = lsn(1)
     dblog._connector.max_lsn = lsn(100)
 
-    drain(dblog, from_lsn=lsn(42))
+    log_batch(dblog, from_lsn=lsn(42))
 
     assert dblog._connector.event_log_calls[0][1] == lsn(42)
 
@@ -561,7 +604,7 @@ def test_accepts_a_start_exactly_on_the_retention_floor(factory_calls):
     dblog = DBLog(**CONNECTION)
     dblog._connector.min_lsn = lsn(40)
 
-    drain(dblog, from_lsn=lsn(40))
+    log_batch(dblog, from_lsn=lsn(40))
 
     assert dblog._connector.event_log_calls[0][1] == lsn(40)
 
@@ -572,7 +615,7 @@ def test_refuses_a_start_that_aged_out_of_retention(factory_calls):
     dblog._connector.min_lsn = lsn(40)
 
     with pytest.raises(CdcRetentionExpiredError, match="no longer retains"):
-        drain(dblog, from_lsn=lsn(39))
+        log_batch(dblog, from_lsn=lsn(39))
 
 
 def test_refuses_a_table_that_is_not_captured(factory_calls):
@@ -580,7 +623,7 @@ def test_refuses_a_table_that_is_not_captured(factory_calls):
     dblog._connector.spec = SPEC.model_copy(update={"capture_instance": None})
 
     with pytest.raises(ValueError, match="capture instance"):
-        drain(dblog, from_lsn=lsn(10))
+        log_batch(dblog, from_lsn=lsn(10))
 
 
 def test_starting_a_run_clears_the_dump_state(factory_calls):
@@ -588,7 +631,7 @@ def test_starting_a_run_clears_the_dump_state(factory_calls):
     dblog._chunk_key = 999
     dblog._dump_done = True
 
-    drain(dblog, from_lsn=lsn(10))
+    log_batch(dblog, from_lsn=lsn(10))
 
     assert dblog._chunk_key is None
     assert dblog._dump_done is False
@@ -602,7 +645,7 @@ def test_starting_a_run_clears_the_dump_state(factory_calls):
 def test_records_the_dump_it_was_asked_to_run(factory_calls):
     dblog = DBLog(**CONNECTION, state_store=StubStore())
 
-    list(dblog.run("dbo", "sales", dump="sales-backfill"))
+    dblog.run("dbo", "sales", dump="sales-backfill")
 
     assert dblog._dump == "sales-backfill"
 
@@ -610,7 +653,7 @@ def test_records_the_dump_it_was_asked_to_run(factory_calls):
 def test_an_unnamed_run_has_no_dump(factory_calls):
     dblog = DBLog(**CONNECTION)
 
-    drain(dblog, from_lsn=lsn(10))
+    log_batch(dblog, from_lsn=lsn(10))
 
     assert dblog._dump is None
 
@@ -621,14 +664,14 @@ def test_refuses_a_blank_dump_name(factory_calls, name):
     dblog = DBLog(**CONNECTION, state_store=StubStore())
 
     with pytest.raises(ValueError, match="blank"):
-        list(dblog.run("dbo", "sales", dump=name))
+        dblog.run("dbo", "sales", dump=name)
 
 
 def test_a_blank_dump_name_is_caught_before_the_source_is_touched(factory_calls):
     dblog = DBLog(**CONNECTION)
 
     with pytest.raises(ValueError):
-        list(dblog.run("dbo", "sales", dump=""))
+        dblog.run("dbo", "sales", dump="")
 
     assert dblog._connector.inspect_calls == []
 
@@ -895,7 +938,11 @@ def test_matches_on_every_primary_key_column(factory_calls):
 
 
 def full_run(dblog: DBLog, name: str = "sales-backfill", **kwargs) -> list[DataFrame]:
-    return list(dblog.run("dbo", "sales", dump=name, **kwargs))
+    """Every batch a dump run has to give, the way a caller's loop collects them."""
+    frames = []
+    while (frame := dblog.run("dbo", "sales", dump=name, **kwargs)) is not None:
+        frames.append(frame)
+    return frames
 
 
 def committing_run(
@@ -903,7 +950,7 @@ def committing_run(
 ) -> list[DataFrame]:
     """A full run that commits each frame, the way a consumer that writes them does."""
     frames = []
-    for frame in dblog.run("dbo", "sales", dump=name, **kwargs):
+    while (frame := dblog.run("dbo", "sales", dump=name, **kwargs)) is not None:
         frames.append(frame)
         dblog.commit()
     return frames
@@ -1040,20 +1087,30 @@ def test_a_chunk_wholly_superseded_is_not_emitted(factory_calls):
     assert [frame["sale_id"].to_list() for frame in frames] == [[1, 2]]
 
 
+def dump_only(dblog: DBLog, name: str = "sales-backfill", **kwargs) -> list[DataFrame]:
+    """The batches up to the end of the table, the way a backfill bounds its loop."""
+    frames = []
+    while not dblog.dump_done:
+        frame = dblog.run("dbo", "sales", dump=name, **kwargs)
+        if frame is not None:
+            frames.append(frame)
+    return frames
+
+
 def test_walks_the_whole_table_and_then_leaves(factory_calls):
     """
-    The run is over when the table is: events after the last chunk belong to the
-    next run, which will pick them up from the recorded position.
+    A caller after the table and no more stops on ``dump_done``: events that landed
+    after the last chunk are the log's business, and wait for whatever tails it.
     """
     dblog = dumping(factory_calls, chunk_size=2)
     dblog._connector.row_script = [sales(1, 2), sales(3)]
     dblog._connector.event_script = [None, None, events(77)]
     dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400), lsn(500)]
 
-    frames = full_run(dblog, from_lsn=lsn(10))
+    frames = dump_only(dblog, from_lsn=lsn(10))
 
     assert [frame["sale_id"].to_list() for frame in frames] == [[1, 2], [3]]
-    assert dblog._dump_done is True
+    assert dblog.dump_done is True
 
 
 def test_a_dump_of_an_empty_table_still_drains_the_log(factory_calls):
@@ -1067,22 +1124,38 @@ def test_a_dump_of_an_empty_table_still_drains_the_log(factory_calls):
     assert [frame["sale_id"].to_list() for frame in frames] == [[5]]
 
 
-def test_a_dump_run_stops_once_the_table_is_walked(factory_calls):
-    """It does not go on tailing the log: the caller decides when to come back."""
+def test_the_dump_reads_one_window_per_chunk_and_no_more(factory_calls):
+    """Each chunk gets the window bracketing it; none of them tails on its own."""
     dblog = dumping(factory_calls, chunk_size=2)
     dblog._connector.row_script = [sales(1, 2), sales(3)]
     dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
 
-    full_run(dblog, from_lsn=lsn(10))
+    dump_only(dblog, from_lsn=lsn(10))
 
     assert dblog._connector.calls.count("read_event_log") == 2
+
+
+def test_a_call_past_the_end_of_the_table_tails_the_log(factory_calls):
+    """The table is walked, so a batch is a window on its own from here on."""
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2), sales(3)]
+    dblog._connector.event_script = [None, None, events(77)]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400), lsn(500)]
+    dump_only(dblog, from_lsn=lsn(10))
+    walked = len(dblog._connector.read_table_calls)
+
+    frame = dblog.run("dbo", "sales", dump="sales-backfill")
+
+    assert frame is not None
+    assert frame["sale_id"].to_list() == [77]
+    assert len(dblog._connector.read_table_calls) == walked  # no further table read
 
 
 def test_an_unnamed_run_records_nothing(factory_calls):
     dblog = dumping(factory_calls)
     dblog._connector.max_lsn = lsn(200)
 
-    list(dblog.run("dbo", "sales", from_lsn=lsn(10)))
+    dblog.run("dbo", "sales", from_lsn=lsn(10))
 
     assert dblog._store.saves == []
 
@@ -1140,12 +1213,12 @@ def test_an_uncommitted_run_is_read_again_from_the_start(factory_calls):
     first = DBLog(**CONNECTION, chunk_size=2, state_store=store)
     first._connector.row_script = [sales(1, 2), sales(3)]
     first._connector.max_lsn_script = [lsn(200), lsn(300)]
-    list(first.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10)))
+    full_run(first, from_lsn=lsn(10))
 
     second = DBLog(**CONNECTION, chunk_size=2, state_store=store)
     second._connector.row_script = [sales(1, 2)]
     second._connector.max_lsn_script = [lsn(400)]
-    list(second.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10)))
+    second.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))
 
     assert second._connector.read_table_calls[0][1] is None
 
@@ -1164,7 +1237,7 @@ def test_commit_records_nothing_for_a_run_with_no_dump(factory_calls):
     dblog = DBLog(**CONNECTION, state_store=StubStore())
     dblog._connector.max_lsn = lsn(200)
 
-    drain(dblog, from_lsn=lsn(10))
+    log_batch(dblog, from_lsn=lsn(10))
     dblog.commit()
 
     assert dblog._store.saves == []
@@ -1176,8 +1249,7 @@ def test_committing_twice_records_the_same_position(factory_calls):
     dblog._connector.row_script = [sales(1, 2), sales(3, 4)]
     dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
 
-    stream = dblog.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))
-    next(stream)
+    dblog.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))
     dblog.commit()
     dblog.commit()
 
@@ -1302,10 +1374,8 @@ def test_an_interrupted_dump_picks_up_from_its_last_record(factory_calls):
     first = DBLog(**CONNECTION, chunk_size=2, state_store=store)
     first._connector.row_script = [sales(1, 2), sales(3, 4)]
     first._connector.max_lsn_script = [lsn(200), lsn(300)]
-    stream = first.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))
-    taken = [next(stream)]
-    first.commit()  # the first chunk was written; the next one "crashes"
-    stream.close()
+    taken = [first.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))]
+    first.commit()  # the first chunk was written; then the process "crashes"
 
     second = DBLog(**CONNECTION, chunk_size=2, state_store=store)
     second._connector.row_script = [sales(3, 4), sales(5)]
@@ -1342,7 +1412,7 @@ def test_reads_one_window_and_stops(factory_calls):
     dblog._connector.max_lsn_script = [lsn(100), lsn(200)]
     dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
 
-    frames = drain(dblog, from_lsn=lsn(10))
+    frames = log_batch(dblog, from_lsn=lsn(10))
 
     assert [frame.to_dicts() for frame in frames] == [[{"sale_id": 1}]]
     assert dblog._connector.calls.count("read_event_log") == 1
@@ -1354,12 +1424,12 @@ def test_a_second_call_picks_up_where_the_first_left_off(factory_calls):
     dblog._connector.max_lsn_script = [lsn(100)]
     dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
 
-    drain(dblog, from_lsn=lsn(10))
+    log_batch(dblog, from_lsn=lsn(10))
 
     dblog._connector.max_lsn_script = [lsn(200)]
     dblog._connector.event_script = [DataFrame({"sale_id": [2]})]
 
-    frames = drain(dblog, from_lsn=dblog.last_lsn)
+    frames = log_batch(dblog, from_lsn=dblog.last_lsn)
 
     assert [frame.to_dicts() for frame in frames] == [[{"sale_id": 2}]]
     assert dblog._connector.event_log_calls[-1][1] == lsn(101)
@@ -1372,7 +1442,7 @@ def test_does_not_chase_a_log_end_that_keeps_moving(factory_calls):
     dblog._connector.max_lsn_script = [lsn(100), lsn(200), lsn(300)]
     dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
 
-    drain(dblog, from_lsn=lsn(10))
+    log_batch(dblog, from_lsn=lsn(10))
 
     assert len(dblog._connector.event_log_calls) == 1
 
@@ -1381,7 +1451,7 @@ def test_yields_nothing_when_there_is_no_new_event(factory_calls):
     dblog = DBLog(**CONNECTION)
     dblog._connector.events = None
 
-    assert drain(dblog, from_lsn=lsn(10)) == []
+    assert log_batch(dblog, from_lsn=lsn(10)) == []
 
 
 def test_leaves_the_last_lsn_at_the_handoff_position(factory_calls):
@@ -1389,15 +1459,16 @@ def test_leaves_the_last_lsn_at_the_handoff_position(factory_calls):
     dblog = DBLog(**CONNECTION)
     dblog._connector.max_lsn = lsn(100)
 
-    drain(dblog, from_lsn=lsn(10))
+    log_batch(dblog, from_lsn=lsn(10))
 
     assert dblog.last_lsn == lsn(101)
 
 
-def test_run_does_nothing_until_it_is_iterated(factory_calls):
-    """It is a generator: a run that is never consumed must not touch the source."""
+def test_a_call_reads_the_source_there_and_then(factory_calls):
+    """Not a generator: the batch is read by the call, not by consuming a result."""
     dblog = DBLog(**CONNECTION)
 
-    dblog.run("dbo", "sales")
+    dblog.run("dbo", "sales", from_lsn=lsn(10))
 
-    assert dblog._connector.inspect_calls == []
+    assert dblog._connector.inspect_calls == [("dbo", "sales")]
+    assert dblog._connector.calls.count("read_event_log") == 1

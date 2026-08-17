@@ -74,10 +74,14 @@ def dumped(dblog, connector, spec) -> list[DataFrame]:
 
     Module-scoped: one run answers every question below, and a dump run is not cheap.
     """
-    frames = []
-    for index, frame in enumerate(dblog.run(LAB_SCHEMA, LAB_TABLE, dump="concat-proof")):
+    frames: list[DataFrame] = []
+    while not dblog.dump_done:
+        frame = dblog.run(LAB_SCHEMA, LAB_TABLE, dump="concat-proof")
+        if frame is None:
+            continue
+
         frames.append(frame)
-        if index == 0:
+        if len(frames) == 1:
             # A write mid-run, so at least one window is non-empty and the merge path
             # is exercised rather than every chunk sailing through untouched.
             #
@@ -209,7 +213,11 @@ def raced(dblog, connector, spec) -> Raced:
 
     dblog._connector.read_table = read_then_write
     try:
-        frames = list(dblog.run(LAB_SCHEMA, LAB_TABLE, dump="race-proof"))
+        frames = []
+        while not dblog.dump_done:
+            frame = dblog.run(LAB_SCHEMA, LAB_TABLE, dump="race-proof")
+            if frame is not None:
+                frames.append(frame)
     finally:
         dblog._connector.read_table = original
 
