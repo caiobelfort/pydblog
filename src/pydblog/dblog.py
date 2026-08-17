@@ -12,7 +12,7 @@ from collections.abc import Generator
 from datetime import datetime
 from types import TracebackType
 
-from polars import DataFrame
+from polars import DataFrame, concat
 
 from pydblog.connectors.base import SourceConnector, build_connector
 from pydblog.connectors.types import LSN, SourceType, TableSpec
@@ -257,9 +257,10 @@ class DBLog:
         holds the table wants.
 
         A dump run alternates the two: a chunk of rows, then the log window that
-        brackets reading it, with the window's events emitted first and the chunk
-        emitted after, minus whatever the window supersedes. It ends when the table
-        runs out. Progress is recorded after each chunk, so a run cut short by a lost
+        brackets reading it. Each iteration yields a single frame combining the
+        window's events with the chunk's rows, minus whatever the window supersedes,
+        window events ordered first. It ends when the table runs out. Progress is
+        recorded after each chunk, so a run cut short by a lost
         connection resumes at the chunk it was on rather than at the start of the
         table; re-running the same name once the table is done skips the chunks and
         tails the log instead.
@@ -318,13 +319,12 @@ class DBLog:
 
                 window = self._read_window()
 
-                if window is not None:
-                    yield window
-
                 if chunk is not None:
                     merged = self._merge_chunk(chunk, window, low)
                     if not merged.is_empty():
                         yield merged
+                elif window is not None:
+                    yield window
 
                 # After the yields, not before: this line only runs once the consumer
                 # comes back for more, which is the only evidence there is that it
@@ -388,11 +388,13 @@ class DBLog:
         self, chunk: DataFrame, window: DataFrame | None, low: datetime
     ) -> DataFrame:
         """
-        Drop what the window supersedes, then stamp what is left into an event.
+        Combine a chunk with the window bracketing it into one frame.
 
-        The stamping is what makes a dump run yield one schema: the frame a chunk
-        produces ends up with the same columns as the frame a window produces, so a
-        consumer can stack every frame of the run without reconciling two layouts.
+        Drops what the window supersedes from the chunk, stamps what is left into an
+        event, then puts the window's own events ahead of it. The stamping is what
+        makes this a single schema: the frame a chunk produces ends up with the same
+        columns as the frame a window produces, so a consumer can stack every frame
+        of the run without reconciling two layouts.
 
         Args:
             chunk: Rows read from the table.
@@ -401,7 +403,8 @@ class DBLog:
                 rows, none of which can be older than it.
 
         Returns:
-            The surviving rows, in the event schema.
+            The window's events, if any, followed by the surviving chunk rows, all
+            in the event schema.
 
         Raises:
             RuntimeError: If the run state has not been seeded yet.
@@ -410,9 +413,14 @@ class DBLog:
         if self._spec is None:
             raise RuntimeError("run not started: no primary key to merge on")
 
-        return self._connector.to_events(
+        events = self._connector.to_events(
             self._supersede(chunk, window), self._spec, low
         )
+
+        if window is None or window.is_empty():
+            return events
+
+        return concat([window, events])
 
     def _next_chunk(self) -> DataFrame | None:
         """

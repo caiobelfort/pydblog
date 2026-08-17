@@ -794,9 +794,15 @@ def events(*sale_ids: int) -> DataFrame:
         {
             "start_lsn": [lsn(n) for n in sale_ids],
             "operation": [4] * len(sale_ids),
+            "commit_timestamp": [COMMIT_TIME] * len(sale_ids),
             "sale_id": list(sale_ids),
             "amount": [99] * len(sale_ids),
-        }
+        },
+        schema_overrides={
+            "start_lsn": Binary,
+            "operation": Int32,
+            "commit_timestamp": Datetime("us"),
+        },
     )
 
 
@@ -925,8 +931,8 @@ def test_emits_the_window_before_the_chunk_it_brackets(factory_calls):
 
     frames = full_run(dblog, from_lsn=lsn(10))
 
-    assert frames[0]["sale_id"].to_list() == [50]
-    assert frames[1]["sale_id"].to_list() == [1, 2]
+    assert len(frames) == 1
+    assert frames[0]["sale_id"].to_list() == [50, 1, 2]
 
 
 def test_the_window_supersedes_the_chunk_rows_it_covers(factory_calls):
@@ -937,7 +943,7 @@ def test_the_window_supersedes_the_chunk_rows_it_covers(factory_calls):
 
     frames = full_run(dblog, from_lsn=lsn(10))
 
-    assert [frame["sale_id"].to_list() for frame in frames] == [[2], [1, 3], [4]]
+    assert [frame["sale_id"].to_list() for frame in frames] == [[2, 1, 3], [4]]
 
 
 def test_chunk_frames_are_stamped_into_the_event_shape(factory_calls):
