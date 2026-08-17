@@ -1088,20 +1088,13 @@ def test_a_chunk_wholly_superseded_is_not_emitted(factory_calls):
 
 
 def dump_only(dblog: DBLog) -> list[DataFrame]:
-    """
-    The batches up to the end of the table, the way a backfill bounds its loop.
-
-    Fetches before asking ``dump_done``, never the other way round: the dump is not
-    seeded until the first fetch names it, so beforehand the flag still describes
-    whatever ran last — and on a reused instance that means skipping this dump whole.
-    """
+    """The batches up to the end of the table, the way a backfill bounds its loop."""
     frames = []
-    while True:
+    while not dblog.dump_done:
         frame = dblog.fetch()
         if frame is not None:
             frames.append(frame)
-        if dblog.dump_done or frame is None:
-            return frames
+    return frames
 
 
 def test_walks_the_whole_table_and_then_leaves(factory_calls):
@@ -1430,8 +1423,41 @@ def test_a_dump_run_ends_at_the_handoff_position(factory_calls):
 
 
 # ---------------------------------------------------------------------------
-# run(dump=False) — drain the log and stop; polling belongs to the caller
+# dump=None — read the log and nothing else; polling belongs to the caller
 # ---------------------------------------------------------------------------
+
+
+def test_a_run_with_no_dump_never_reads_the_table(factory_calls):
+    dblog = make(from_lsn=lsn(10))
+    dblog._connector.event_script = [DataFrame({"sale_id": [1]}), None]
+
+    log_batch(dblog)
+    log_batch(dblog)
+
+    assert dblog._connector.read_table_calls == []
+
+
+def test_a_run_with_no_dump_has_no_table_left_to_walk(factory_calls):
+    """
+    There is no dump to finish, so the backfill loop has nothing to wait for. Reporting
+    False would leave ``while not dblog.dump_done`` spinning on a condition that
+    nothing can ever satisfy, one get_max_lsn round trip per turn, forever.
+    """
+    dblog = make(from_lsn=lsn(10))
+
+    assert dblog.dump_done is True
+
+    log_batch(dblog)
+
+    assert dblog.dump_done is True
+
+
+def test_the_backfill_loop_terminates_on_a_run_with_no_dump(factory_calls):
+    dblog = make(from_lsn=lsn(10))
+    dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
+
+    assert dump_only(dblog) == []
+    assert dblog._connector.calls == []  # and it asked the source nothing
 
 
 def test_reads_one_window_and_stops(factory_calls):

@@ -72,6 +72,12 @@ seeded, so a finished dump left it True and the next dump's loop never ran at al
 `test_a_finished_dump_does_not_bound_a_dump_on_another_instance` pins that it starts
 False per instance.
 
+`dump_done` is `self._dump is None or self._dump_done`, and the first half is not
+cosmetic: a log-only run has no table walk, so reporting False would leave that same
+loop spinning on a condition nothing can satisfy — one `get_max_lsn` round trip per
+turn, forever. Vacuous truth makes it terminate instead, at the cost of doing nothing,
+which is the right answer to "walk the table" when there is no dump.
+
 The window closes *after* the chunk scan, so anything committed during the scan lands
 inside it and the chunk cannot carry a stale row the window does not also correct.
 Windows are half-open via `increment_lsn`, because the CDC read is inclusive on both

@@ -161,12 +161,11 @@ class DBLog:
     @property
     def dump_done(self) -> bool:
         """
-        Whether the table has been walked to the end.
+        Whether there is any of the table left to walk.
 
-        False before the first ``fetch``, and for a run given no dump name. Once it is
-        True, further calls to ``fetch`` read the log alone — a batch is a window and
-        nothing more — so this is what a caller that wants the table and not an
-        open-ended tail loops on:
+        False before the first ``fetch``. Once it is True, further calls to ``fetch``
+        read the log alone — a batch is a window and nothing more — so this is what a
+        caller that wants the table and not an open-ended tail loops on:
 
         ```python
         while not dblog.dump_done:
@@ -174,13 +173,20 @@ class DBLog:
             ...
         ```
 
-        Safe to test before fetching precisely because an instance is one run: it
-        starts False and only the run's own progress moves it. A recorded dump that had
-        already finished shows False until the first fetch loads that, which costs the
-        loop one turn and reads a window it was going to want anyway.
+        Safe to test before fetching because an instance is one run: it starts False
+        and only that run's own progress moves it. A recorded dump that had already
+        finished shows False until the first fetch loads that, which costs the loop one
+        turn and reads a window it was going to want anyway.
+
+        **True from the start for a run with no dump**, which has no table walk to
+        finish. That keeps the loop above terminating rather than spinning forever on a
+        condition nothing could ever satisfy — but it also means the loop does nothing
+        at all for such a run, which is the honest answer to "walk the table" when
+        there is no dump. A log-only caller wants the other shape, ``while
+        (frame := dblog.fetch()) is not None``, or a poll of its own.
         """
 
-        return self._dump_done
+        return self._dump is None or self._dump_done
 
     def _start(self) -> None:
         """

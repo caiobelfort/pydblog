@@ -42,6 +42,11 @@ while not dblog.dump_done:
         dblog.commit()
 ```
 
+`dump_done` is about the table walk, so it is `True` from the start when there is no
+`dump` — that loop does nothing at all for a log-only run, which is the honest answer
+to "walk the table" when there is no table walk to do. Log-only callers want the
+`is not None` shape above, or a poll of their own.
+
 Rows that came off the table rather than out of the log are marked with an all-zero
 `start_lsn` and `operation = 0`, a position CDC never issues.
 
