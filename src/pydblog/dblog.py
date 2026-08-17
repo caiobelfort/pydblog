@@ -265,10 +265,14 @@ class DBLog:
         table; re-running the same name once the table is done skips the chunks and
         tails the log instead.
 
-        A run with no dump drains the interval it is given and stops once it is caught
-        up, rather than polling for more. It has to be given one: ``from_lsn`` is
-        required without a dump. A caller that wants to tail continuously loops over
-        ``run`` itself, handing ``last_lsn`` back in as ``from_lsn`` each time.
+        A run with no dump reads one window, from ``from_lsn`` to wherever the log's
+        end is at that moment, and stops — it does not loop internally until caught
+        up, since a table with a steady stream of writes would keep extending that
+        end and the run would never return. It has to be given a starting point:
+        ``from_lsn`` is required without a dump. A caller that wants to tail
+        continuously loops over ``run`` itself, handing ``last_lsn`` back in as
+        ``from_lsn`` each time; that outer loop is what naturally spaces out polls
+        against a source under heavy write load.
 
         This is a generator: nothing is read, and none of the errors below are
         raised, until it is iterated.
@@ -334,7 +338,8 @@ class DBLog:
 
             return
 
-        while (events := self._read_window()) is not None:
+        events = self._read_window()
+        if events is not None:
             yield events
             self._checkpoint()
 

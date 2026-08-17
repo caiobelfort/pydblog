@@ -1251,31 +1251,49 @@ def test_a_dump_run_ends_at_the_handoff_position(factory_calls):
 # ---------------------------------------------------------------------------
 
 
-def test_yields_each_window_that_held_events(factory_calls):
+def test_reads_one_window_and_stops(factory_calls):
+    """
+    A single call does not loop until caught up: on a table with a steady stream
+    of writes, the log's end keeps moving and a call that chased it would never
+    return. One window per call, and the caller loops for more.
+    """
     dblog = DBLog(**CONNECTION)
-    dblog._connector.max_lsn_script = [lsn(100), lsn(200), lsn(300)]
-    dblog._connector.event_script = [
-        DataFrame({"sale_id": [1]}),
-        DataFrame({"sale_id": [2]}),
-    ]
+    dblog._connector.max_lsn_script = [lsn(100), lsn(200)]
+    dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
 
     frames = drain(dblog, from_lsn=lsn(10))
 
-    assert [frame.to_dicts() for frame in frames] == [
-        [{"sale_id": 1}],
-        [{"sale_id": 2}],
-    ]
+    assert [frame.to_dicts() for frame in frames] == [[{"sale_id": 1}]]
+    assert dblog._connector.calls.count("read_event_log") == 1
 
 
-def test_stops_once_the_log_is_caught_up(factory_calls):
-    """Three max LSNs are on offer; the run stops at the first empty window."""
+def test_a_second_call_picks_up_where_the_first_left_off(factory_calls):
+    """The caller polls by re-running with last_lsn, not by one call looping."""
+    dblog = DBLog(**CONNECTION)
+    dblog._connector.max_lsn_script = [lsn(100)]
+    dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
+
+    drain(dblog, from_lsn=lsn(10))
+
+    dblog._connector.max_lsn_script = [lsn(200)]
+    dblog._connector.event_script = [DataFrame({"sale_id": [2]})]
+
+    frames = drain(dblog, from_lsn=dblog.last_lsn)
+
+    assert [frame.to_dicts() for frame in frames] == [[{"sale_id": 2}]]
+    assert dblog._connector.event_log_calls[-1][1] == lsn(101)
+
+
+def test_does_not_chase_a_log_end_that_keeps_moving(factory_calls):
+    """Three max LSNs are on offer, as a table under steady writes would produce;
+    the run still stops after the one window, not once the log looks caught up."""
     dblog = DBLog(**CONNECTION)
     dblog._connector.max_lsn_script = [lsn(100), lsn(200), lsn(300)]
     dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
 
     drain(dblog, from_lsn=lsn(10))
 
-    assert len(dblog._connector.event_log_calls) == 2
+    assert len(dblog._connector.event_log_calls) == 1
 
 
 def test_yields_nothing_when_there_is_no_new_event(factory_calls):
