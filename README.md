@@ -17,7 +17,7 @@ with DBLog(
     user="sa", password="...", database="dblog_lab",
     chunk_size=1000,
 ) as dblog:
-    while (frame := dblog.run("dbo", "sales", dump="sales-backfill")) is not None:
+    while (frame := dblog.fetch("dbo", "sales", dump="sales-backfill")) is not None:
         frame.write_delta("s3://lake/sales", mode="append")
         dblog.commit()  # only now is that batch's position recorded
 ```
@@ -27,15 +27,22 @@ is bounded by `chunk_size` however large the table is. The first call inspects t
 table and loads whatever progress is recorded; the rest just advance.
 
 That loop runs until the table is walked *and* the log is caught up. To stop at the
-end of the table instead — a backfill rather than a tail — loop on `dump_done`:
+end of the table instead — a backfill rather than a tail — stop on `dump_done`:
 
 ```python
-while not dblog.dump_done:
-    frame = dblog.run("dbo", "sales", dump="sales-backfill")
+while True:
+    frame = dblog.fetch("dbo", "sales", dump="sales-backfill")
     if frame is not None:
         frame.write_delta("s3://lake/sales", mode="append")
         dblog.commit()
+
+    if dblog.dump_done:
+        break
 ```
+
+Fetch first and ask `dump_done` after, not the other way round: a dump is only
+seeded once `fetch()` has named it, so beforehand the flag still describes whatever
+that instance ran last — and testing it up front would skip the new dump entirely.
 
 Rows that came off the table rather than out of the log are marked with an all-zero
 `start_lsn` and `operation = 0`, a position CDC never issues.

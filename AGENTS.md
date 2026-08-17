@@ -5,8 +5,8 @@ what will bite you.
 
 ## What this is
 
-The DBLog algorithm over SQL Server CDC. `DBLog.run()` interleaves a chunked table dump
-with the change log, returning one polars DataFrame per call.
+The DBLog algorithm over SQL Server CDC. `DBLog.fetch()` interleaves a chunked table
+dump with the change log, returning one polars DataFrame per call.
 
 `DBLog` owns the algorithm; the connector owns the database. `DBLog._connector` is
 typed as the `SourceConnector` Protocol, not as `MSSQLConnector`, so the algorithm can
@@ -42,7 +42,7 @@ session creates. The script is idempotent.
 
 Each is unremarkable alone; the shape only makes sense together.
 
-**The run loop** (`DBLog.run()`) is the algorithm, and its ordering is load-bearing:
+**The run loop** (`DBLog.fetch()`) is the algorithm, and its ordering is load-bearing:
 
 ```
 one call, one batch:
@@ -55,11 +55,18 @@ one call, one batch:
                                       # caller calls commit() once it has written it
 ```
 
-`run()` returns one frame, or None when the table is walked and the log is caught up.
+`fetch()` returns one frame, or None when the table is walked and the log is caught up.
 It is not a generator and holds nothing back: the read happens in the call. Past the
-end of the table a batch is a window alone, so a plain `while run() is not None` loop
+end of the table a batch is a window alone, so a plain `while fetch() is not None` loop
 slides from dumping into tailing — `dump_done` is there for a caller that wants to
 stop at the end of the table instead.
+
+**`dump_done` is about the run that is seeded, so fetch before you ask it.** A dump is
+not seeded until `fetch()` names it, and `_start()` is what resets the flag. Testing it
+first — `while not dblog.dump_done:` — reads the *previous* dump's state, and on a
+reused `DBLog` that means the loop never runs and the new dump returns nothing. This
+bit the integration fixtures, which share one module-scoped instance across two dumps;
+`test_a_finished_dump_does_not_bound_the_next_one` pins it.
 
 The window closes *after* the chunk scan, so anything committed during the scan lands
 inside it and the chunk cannot carry a stale row the window does not also correct.

@@ -435,7 +435,7 @@ def log_batch(dblog: DBLog, **kwargs) -> list[DataFrame]:
     Returned as a list so a test can assert on a read that found nothing as easily as
     on one that found events.
     """
-    frame = dblog.run("dbo", "sales", **kwargs)
+    frame = dblog.fetch("dbo", "sales", **kwargs)
     return [] if frame is None else [frame]
 
 
@@ -466,8 +466,8 @@ def test_a_different_dump_name_seeds_a_new_run(factory_calls):
     dblog._connector.row_script = [sales(1, 2), sales(3, 4)]
     dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
 
-    dblog.run("dbo", "sales", dump="first", from_lsn=lsn(10))
-    dblog.run("dbo", "sales", dump="second", from_lsn=lsn(10))
+    dblog.fetch("dbo", "sales", dump="first", from_lsn=lsn(10))
+    dblog.fetch("dbo", "sales", dump="second", from_lsn=lsn(10))
 
     assert dblog._dump == "second"
     assert dblog._connector.inspect_calls == [("dbo", "sales")] * 2
@@ -479,8 +479,8 @@ def test_a_later_from_lsn_does_not_move_a_run_already_under_way(factory_calls):
     dblog = DBLog(**CONNECTION)
     dblog._connector.max_lsn_script = [lsn(100), lsn(200)]
 
-    dblog.run("dbo", "sales", from_lsn=lsn(10))
-    dblog.run("dbo", "sales", from_lsn=lsn(9_000))
+    dblog.fetch("dbo", "sales", from_lsn=lsn(10))
+    dblog.fetch("dbo", "sales", from_lsn=lsn(9_000))
 
     assert dblog._connector.event_log_calls[-1][1] == lsn(101)
 
@@ -645,7 +645,7 @@ def test_starting_a_run_clears_the_dump_state(factory_calls):
 def test_records_the_dump_it_was_asked_to_run(factory_calls):
     dblog = DBLog(**CONNECTION, state_store=StubStore())
 
-    dblog.run("dbo", "sales", dump="sales-backfill")
+    dblog.fetch("dbo", "sales", dump="sales-backfill")
 
     assert dblog._dump == "sales-backfill"
 
@@ -664,14 +664,14 @@ def test_refuses_a_blank_dump_name(factory_calls, name):
     dblog = DBLog(**CONNECTION, state_store=StubStore())
 
     with pytest.raises(ValueError, match="blank"):
-        dblog.run("dbo", "sales", dump=name)
+        dblog.fetch("dbo", "sales", dump=name)
 
 
 def test_a_blank_dump_name_is_caught_before_the_source_is_touched(factory_calls):
     dblog = DBLog(**CONNECTION)
 
     with pytest.raises(ValueError):
-        dblog.run("dbo", "sales", dump="")
+        dblog.fetch("dbo", "sales", dump="")
 
     assert dblog._connector.inspect_calls == []
 
@@ -940,7 +940,7 @@ def test_matches_on_every_primary_key_column(factory_calls):
 def full_run(dblog: DBLog, name: str = "sales-backfill", **kwargs) -> list[DataFrame]:
     """Every batch a dump run has to give, the way a caller's loop collects them."""
     frames = []
-    while (frame := dblog.run("dbo", "sales", dump=name, **kwargs)) is not None:
+    while (frame := dblog.fetch("dbo", "sales", dump=name, **kwargs)) is not None:
         frames.append(frame)
     return frames
 
@@ -950,7 +950,7 @@ def committing_run(
 ) -> list[DataFrame]:
     """A full run that commits each frame, the way a consumer that writes them does."""
     frames = []
-    while (frame := dblog.run("dbo", "sales", dump=name, **kwargs)) is not None:
+    while (frame := dblog.fetch("dbo", "sales", dump=name, **kwargs)) is not None:
         frames.append(frame)
         dblog.commit()
     return frames
@@ -1088,13 +1088,20 @@ def test_a_chunk_wholly_superseded_is_not_emitted(factory_calls):
 
 
 def dump_only(dblog: DBLog, name: str = "sales-backfill", **kwargs) -> list[DataFrame]:
-    """The batches up to the end of the table, the way a backfill bounds its loop."""
+    """
+    The batches up to the end of the table, the way a backfill bounds its loop.
+
+    Fetches before asking ``dump_done``, never the other way round: the dump is not
+    seeded until the first fetch names it, so beforehand the flag still describes
+    whatever ran last — and on a reused instance that means skipping this dump whole.
+    """
     frames = []
-    while not dblog.dump_done:
-        frame = dblog.run("dbo", "sales", dump=name, **kwargs)
+    while True:
+        frame = dblog.fetch("dbo", "sales", dump=name, **kwargs)
         if frame is not None:
             frames.append(frame)
-    return frames
+        if dblog.dump_done or frame is None:
+            return frames
 
 
 def test_walks_the_whole_table_and_then_leaves(factory_calls):
@@ -1111,6 +1118,25 @@ def test_walks_the_whole_table_and_then_leaves(factory_calls):
 
     assert [frame["sale_id"].to_list() for frame in frames] == [[1, 2], [3]]
     assert dblog.dump_done is True
+
+
+def test_a_finished_dump_does_not_bound_the_next_one(factory_calls):
+    """
+    ``dump_done`` is about the seeded run, and a dump nobody has fetched yet is not
+    seeded — so the flag left True by the last dump must not be read as this one
+    already being over. A loop that trusted it would return no batches at all.
+    """
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2), sales(3)]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+    dump_only(dblog, "first", from_lsn=lsn(10))
+    assert dblog.dump_done is True
+
+    dblog._connector.row_script = [sales(4, 5), sales(6)]
+    dblog._connector.max_lsn_script = [lsn(400), lsn(500)]
+    frames = dump_only(dblog, "second", from_lsn=lsn(10))
+
+    assert [frame["sale_id"].to_list() for frame in frames] == [[4, 5], [6]]
 
 
 def test_a_dump_of_an_empty_table_still_drains_the_log(factory_calls):
@@ -1144,7 +1170,7 @@ def test_a_call_past_the_end_of_the_table_tails_the_log(factory_calls):
     dump_only(dblog, from_lsn=lsn(10))
     walked = len(dblog._connector.read_table_calls)
 
-    frame = dblog.run("dbo", "sales", dump="sales-backfill")
+    frame = dblog.fetch("dbo", "sales", dump="sales-backfill")
 
     assert frame is not None
     assert frame["sale_id"].to_list() == [77]
@@ -1155,7 +1181,7 @@ def test_an_unnamed_run_records_nothing(factory_calls):
     dblog = dumping(factory_calls)
     dblog._connector.max_lsn = lsn(200)
 
-    dblog.run("dbo", "sales", from_lsn=lsn(10))
+    dblog.fetch("dbo", "sales", from_lsn=lsn(10))
 
     assert dblog._store.saves == []
 
@@ -1218,7 +1244,7 @@ def test_an_uncommitted_run_is_read_again_from_the_start(factory_calls):
     second = DBLog(**CONNECTION, chunk_size=2, state_store=store)
     second._connector.row_script = [sales(1, 2)]
     second._connector.max_lsn_script = [lsn(400)]
-    second.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))
+    second.fetch("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))
 
     assert second._connector.read_table_calls[0][1] is None
 
@@ -1249,7 +1275,7 @@ def test_committing_twice_records_the_same_position(factory_calls):
     dblog._connector.row_script = [sales(1, 2), sales(3, 4)]
     dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
 
-    dblog.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))
+    dblog.fetch("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))
     dblog.commit()
     dblog.commit()
 
@@ -1374,7 +1400,7 @@ def test_an_interrupted_dump_picks_up_from_its_last_record(factory_calls):
     first = DBLog(**CONNECTION, chunk_size=2, state_store=store)
     first._connector.row_script = [sales(1, 2), sales(3, 4)]
     first._connector.max_lsn_script = [lsn(200), lsn(300)]
-    taken = [first.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))]
+    taken = [first.fetch("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))]
     first.commit()  # the first chunk was written; then the process "crashes"
 
     second = DBLog(**CONNECTION, chunk_size=2, state_store=store)
@@ -1468,7 +1494,7 @@ def test_a_call_reads_the_source_there_and_then(factory_calls):
     """Not a generator: the batch is read by the call, not by consuming a result."""
     dblog = DBLog(**CONNECTION)
 
-    dblog.run("dbo", "sales", from_lsn=lsn(10))
+    dblog.fetch("dbo", "sales", from_lsn=lsn(10))
 
     assert dblog._connector.inspect_calls == [("dbo", "sales")]
     assert dblog._connector.calls.count("read_event_log") == 1

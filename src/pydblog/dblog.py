@@ -41,7 +41,7 @@ class DBLog:
     window win over the chunk's rows, since they are the newer image. The result is a
     single stream where every row is delivered at least once and never stale.
 
-    ``run`` hands back one batch per call, so the instance carries the run between
+    ``fetch`` hands back one batch per call, so the instance carries the run between
     calls: where the table walk and the log have got to, and which table and dump they
     belong to. That state is only in memory — what survives a process is whatever the
     caller committed.
@@ -109,7 +109,7 @@ class DBLog:
         self._last_lsn: LSN | None = None  # log position reached; next window opens here
         self._chunk_key: int | None = None  # leading PK the next chunk starts at
         self._dump_done: bool = False  # set once a chunk comes back short
-        # What the seeded run is for, so run() can tell "next batch of the same run"
+        # What the seeded run is for, so fetch() can tell "next batch of the same run"
         # from "a different run entirely" and only pay for seeding on the latter.
         self._run: tuple[str, str, str | None] | None = None
 
@@ -130,14 +130,21 @@ class DBLog:
         Whether the table has been walked to the end.
 
         False before a dump starts, and for a run that was never given a dump name.
-        Once it is True, further calls to ``run`` read the log alone — a batch is a
+        Once it is True, further calls to ``fetch`` read the log alone — a batch is a
         window and nothing more — so this is what a caller that wants the table and
-        not an open-ended tail loops on:
+        not an open-ended tail stops on.
+
+        It describes the run that is *seeded*, which is the one the last ``fetch``
+        named. A dump is only seeded once ``fetch`` has been called for it, so this
+        still describes the previous dump until then, and testing it before the first
+        call would skip the new dump entirely. Ask after fetching, not before:
 
         ```python
-        while not dblog.dump_done:
-            frame = dblog.run("dbo", "sales", dump="sales-backfill")
+        while True:
+            frame = dblog.fetch("dbo", "sales", dump="sales-backfill")
             ...
+            if dblog.dump_done:
+                break
         ```
         """
 
@@ -283,7 +290,7 @@ class DBLog:
             f"last_lsn={self._last_lsn.hex()} done={self._dump_done}"
         )
 
-    def run(
+    def fetch(
         self,
         schema: str,
         table: str,
@@ -298,7 +305,7 @@ class DBLog:
         is bounded by ``chunk_size`` however large the table is:
 
         ```python
-        while (frame := dblog.run("dbo", "sales", dump="sales-backfill")) is not None:
+        while (frame := dblog.fetch("dbo", "sales", dump="sales-backfill")) is not None:
             write(frame)
             dblog.commit()
         ```

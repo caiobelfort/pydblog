@@ -75,13 +75,17 @@ def dumped(dblog, connector, spec) -> list[DataFrame]:
     Module-scoped: one run answers every question below, and a dump run is not cheap.
     """
     frames: list[DataFrame] = []
-    while not dblog.dump_done:
-        frame = dblog.run(LAB_SCHEMA, LAB_TABLE, dump="concat-proof")
-        if frame is None:
-            continue
+    written = False
 
-        frames.append(frame)
-        if len(frames) == 1:
+    # Fetch first, then ask whether the table is walked: dump_done still describes
+    # whatever ran before until this dump's first fetch seeds it.
+    while True:
+        frame = dblog.fetch(LAB_SCHEMA, LAB_TABLE, dump="concat-proof")
+        if frame is not None:
+            frames.append(frame)
+
+        if not written:
+            written = True
             # A write mid-run, so at least one window is non-empty and the merge path
             # is exercised rather than every chunk sailing through untouched.
             #
@@ -99,7 +103,8 @@ def dumped(dblog, connector, spec) -> list[DataFrame]:
             )
             wait_for_cdc(connector, spec.capture_instance, before)
 
-    return frames
+        if dblog.dump_done:
+            return frames
 
 
 @pytest.mark.integration
@@ -213,11 +218,15 @@ def raced(dblog, connector, spec) -> Raced:
 
     dblog._connector.read_table = read_then_write
     try:
+        # Fetch first, then ask: this instance already finished "concat-proof", so
+        # dump_done is still True from that one until this dump's first fetch.
         frames = []
-        while not dblog.dump_done:
-            frame = dblog.run(LAB_SCHEMA, LAB_TABLE, dump="race-proof")
+        while True:
+            frame = dblog.fetch(LAB_SCHEMA, LAB_TABLE, dump="race-proof")
             if frame is not None:
                 frames.append(frame)
+            if dblog.dump_done:
+                break
     finally:
         dblog._connector.read_table = original
 
