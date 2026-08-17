@@ -1,5 +1,7 @@
 import logging
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from math import ceil
 from time import monotonic, sleep
@@ -120,6 +122,26 @@ class MSSQLConnector:
 
         return self._conn.cursor()
 
+    @contextmanager
+    def _open_cursor(self) -> Iterator[mssql_python.Cursor]:
+        """A cursor that closes even when the query raises.
+
+        Every read goes through this rather than closing by hand at the end of the
+        happy path. A cursor abandoned by a raised query is not collected on any
+        schedule the caller controls, and it holds whatever the driver buffered for
+        it — so on a long-lived connection meeting intermittent errors, the handles
+        and their buffers accumulate for as long as the process runs.
+
+        Yields:
+            A cursor on the open connection, closed when the block ends.
+        """
+
+        cur = self._cursor()
+        try:
+            yield cur
+        finally:
+            cur.close()
+
     def get_min_lsn(self, capture_instance: str) -> LSN:
         """Fetch the oldest LSN CDC still retains for a capture instance.
 
@@ -136,10 +158,11 @@ class MSSQLConnector:
             ValueError: If CDC does not recognise the capture instance, or the caller is
                 not authorized to read its change data.
         """
-        cur = self._cursor()
-        cur.execute("SELECT sys.fn_cdc_get_min_lsn(?) as min_lsn", [capture_instance])
-        row = cur.fetchone()
-        cur.close()
+        with self._open_cursor() as cur:
+            cur.execute(
+                "SELECT sys.fn_cdc_get_min_lsn(?) as min_lsn", [capture_instance]
+            )
+            row = cur.fetchone()
 
         # Documented behaviour: fn_cdc_get_min_lsn returns 0x0000000000000000_0000 "when
         # the capture instance does not exist or when the caller is not authorized to
@@ -173,10 +196,9 @@ class MSSQLConnector:
             ValueError: If CDC has not produced a watermark yet, which it signals by
                 returning NULL.
         """
-        cur = self._cursor()
-        cur.execute("SELECT sys.fn_cdc_get_max_lsn() as max_lsn")
-        row = cur.fetchone()
-        cur.close()
+        with self._open_cursor() as cur:
+            cur.execute("SELECT sys.fn_cdc_get_max_lsn() as max_lsn")
+            row = cur.fetchone()
 
         if row is None or row[0] is None:
             raise ValueError(
@@ -326,23 +348,25 @@ class MSSQLConnector:
             ValueError: If the table has no primary key, if the two column lists
                 cannot produce one schema, or if a column has no Arrow equivalent.
         """
-        cur = self._cursor()
         object_name = f"{schema}.{table}"
 
-        pk_columns = self._read_pk_columns(cur, object_name)
-        # Ahead of the columns, because the change table's name is built from it.
-        capture_instance = self._read_capture_instance(cur, object_name, capture_schema)
-        columns = self._read_columns(cur, object_name)
-        captured_columns = (
-            # With no change log there is nothing to reconcile against, and the
-            # table's own columns are what a read projects.
-            columns
-            if capture_instance is None
-            else self._mark_computed(
-                self._read_captured_columns(cur, capture_instance, capture_schema),
-                columns,
+        with self._open_cursor() as cur:
+            pk_columns = self._read_pk_columns(cur, object_name)
+            # Ahead of the columns, because the change table's name is built from it.
+            capture_instance = self._read_capture_instance(
+                cur, object_name, capture_schema
             )
-        )
+            columns = self._read_columns(cur, object_name)
+            captured_columns = (
+                # With no change log there is nothing to reconcile against, and the
+                # table's own columns are what a read projects.
+                columns
+                if capture_instance is None
+                else self._mark_computed(
+                    self._read_captured_columns(cur, capture_instance, capture_schema),
+                    columns,
+                )
+            )
 
         spec = TableSpec(
             source_schema=schema,
@@ -352,7 +376,6 @@ class MSSQLConnector:
             captured_columns=captured_columns,
             capture_instance=capture_instance,
         )
-        cur.close()
 
         # Nothing to reconcile without a change table, and a table that has no capture
         # instance already fails with a clearer message when a run starts on it.
@@ -395,10 +418,9 @@ class MSSQLConnector:
 
         logger.debug(f"generated query:\n{query}")
 
-        cur = self._cursor()
-        cur.execute(query, [from_lsn, to_lsn])
-        arrow_table = cur.arrow()
-        cur.close()
+        with self._open_cursor() as cur:
+            cur.execute(query, [from_lsn, to_lsn])
+            arrow_table = cur.arrow()
 
         logger.info(
             f"read {arrow_table.num_rows} events from {spec.capture_instance} "
@@ -457,10 +479,9 @@ class MSSQLConnector:
         Returns:
             The source's current time.
         """
-        cur = self._cursor()
-        cur.execute("SELECT SYSDATETIME()")
-        row = cur.fetchone()
-        cur.close()
+        with self._open_cursor() as cur:
+            cur.execute("SELECT SYSDATETIME()")
+            row = cur.fetchone()
 
         if row is None or row[0] is None:
             raise RuntimeError("the source returned no time for a watermark")
@@ -487,11 +508,10 @@ class MSSQLConnector:
         """
         started = monotonic()
         deadline = started + self._watermark_timeout
-        cur = self._cursor()
 
         logger.debug(f"waiting for capture to pass watermark {mark.isoformat()}")
 
-        try:
+        with self._open_cursor() as cur:
             while monotonic() < deadline:
                 if self._capture_passed(cur, mark):
                     logger.info(
@@ -501,8 +521,6 @@ class MSSQLConnector:
                     return
 
                 sleep(self._watermark_poll)
-        finally:
-            cur.close()
 
         logger.warning(
             f"capture did not pass watermark {mark.isoformat()} within "
@@ -535,10 +553,9 @@ class MSSQLConnector:
         return bool(row and row[0])
 
     def map_lsn_to_timestamp(self, lsn: LSN) -> datetime | None:
-        cur = self._cursor()
-        cur.execute("SELECT sys.fn_cdc_map_lsn_to_time(?)", [lsn])
-        row = cur.fetchone()
-        cur.close()
+        with self._open_cursor() as cur:
+            cur.execute("SELECT sys.fn_cdc_map_lsn_to_time(?)", [lsn])
+            row = cur.fetchone()
 
         if row:
             return row[0]
@@ -694,10 +711,9 @@ class MSSQLConnector:
 
         logger.debug(f"generated query:\n{query}")
 
-        cur = self._cursor()
-        cur.execute(query, params)
-        arrow_table = cur.arrow()
-        cur.close()
+        with self._open_cursor() as cur:
+            cur.execute(query, params)
+            arrow_table = cur.arrow()
 
         logger.info(
             f"read {arrow_table.num_rows} rows from {spec.qualified_name} "
@@ -747,10 +763,9 @@ class MSSQLConnector:
 
         logger.debug(f"generated query:\n{query}")
 
-        cur = self._cursor()
-        cur.execute(query)
-        row = cur.fetchone()
-        cur.close()
+        with self._open_cursor() as cur:
+            cur.execute(query)
+            row = cur.fetchone()
 
         if row is None or row[0] is None:
             logger.info(f"read primary key range of {spec.qualified_name}: empty")

@@ -113,6 +113,85 @@ def test_close_without_connect_is_noop():
     assert conn._conn is None
 
 
+class RecordingCursor:
+    """A cursor that records being closed, and can be told to fail its query."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.closed = False
+        self._fail = fail
+
+    def execute(self, *args, **kwargs) -> None:
+        if self._fail:
+            raise RuntimeError("connection reset by peer")
+
+    def fetchone(self):
+        return [b"\x01" * 10]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class RecordingConnection:
+    """Hands out ``RecordingCursor``s and keeps them, so a test can inspect them."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.cursors: list[RecordingCursor] = []
+        self._fail = fail
+
+    def cursor(self) -> RecordingCursor:
+        self.cursors.append(RecordingCursor(self._fail))
+        return self.cursors[-1]
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_cursor_is_closed_once_the_read_is_done():
+    connector = make_connector()
+    connector._conn = RecordingConnection()
+
+    connector.get_max_lsn()
+
+    assert [c.closed for c in connector._conn.cursors] == [True]
+
+
+def test_a_cursor_is_closed_even_when_the_query_raises():
+    """
+    Otherwise a long-lived connection meeting intermittent errors accumulates
+    abandoned cursors, each holding whatever the driver buffered for it, for as long
+    as the process runs. Every read goes through ``_open_cursor`` for this reason.
+    """
+    connector = make_connector()
+    connector._conn = RecordingConnection(fail=True)
+
+    with pytest.raises(RuntimeError, match="connection reset"):
+        connector.get_max_lsn()
+
+    assert [c.closed for c in connector._conn.cursors] == [True]
+
+
+def test_no_read_closes_its_cursor_by_hand():
+    """
+    A read that closes on the happy path only is the leak this guards against, so the
+    guarantee is structural: nothing opens a bare cursor outside ``_open_cursor``.
+    """
+    import ast
+    import inspect as inspect_module
+
+    from pydblog.connectors.mssql import connector as module
+
+    tree = ast.parse(inspect_module.getsource(module))
+    offenders = [
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name not in ("_cursor", "_open_cursor")
+        and "'_cursor'" in ast.dump(node)
+    ]
+
+    assert offenders == []
+
+
 def test_application_name_defaults():
     assert make_connector()._application_name == "Lakehouse DBLog"
 
