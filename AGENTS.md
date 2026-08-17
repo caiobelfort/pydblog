@@ -49,9 +49,9 @@ per chunk pass:
   _window_low = get_max_lsn()      # before-watermark, for dating this chunk only
   chunk  = _next_chunk()           # keyset page from _chunk_key
   window = _read_window()          # (_last_lsn, get_max_lsn()], then _last_lsn = high+1
-  yield window                     # events first
-  yield _merge_chunk(chunk, window)  # = _supersede (anti-join) + to_events (stamp)
-  _checkpoint()                    # after the yields, so a crash cannot skip a chunk
+  yield _merge_chunk(chunk, window)  # one frame: window events, then _supersede
+                                     # (anti-join) + to_events (stamp) of the chunk
+                                     # caller calls commit() once that frame is written
 ```
 
 The window closes *after* the chunk scan, so anything committed during the scan lands
@@ -77,6 +77,12 @@ either alone would leave rows that neither the remaining chunks nor the remainin
 would deliver. `JsonFileStore` writes to a temp file and `os.replace`s it, so an
 interrupted write leaves the previous state intact. Injecting a `StateStore` is how
 tests avoid the filesystem.
+
+Nothing is written until the caller calls `DBLog.commit()`. The run loop deliberately
+does not do it: receiving a frame is not the same as having written it, and a position
+recorded on the strength of receipt puts the rows behind it out of reach when the
+caller's own write then fails. Uncommitted frames are re-read, which is the safe
+direction to fail in — at-least-once is the guarantee the algorithm already makes.
 
 An `LSN` is `bytes` — 10 bytes, big-endian, so byte order is numeric order and plain
 comparison works.

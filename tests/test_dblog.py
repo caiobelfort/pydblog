@@ -898,6 +898,17 @@ def full_run(dblog: DBLog, name: str = "sales-backfill", **kwargs) -> list[DataF
     return list(dblog.run("dbo", "sales", dump=name, **kwargs))
 
 
+def committing_run(
+    dblog: DBLog, name: str = "sales-backfill", **kwargs
+) -> list[DataFrame]:
+    """A full run that commits each frame, the way a consumer that writes them does."""
+    frames = []
+    for frame in dblog.run("dbo", "sales", dump=name, **kwargs):
+        frames.append(frame)
+        dblog.commit()
+    return frames
+
+
 def test_closes_the_window_after_the_chunk_it_brackets(factory_calls):
     """
     The window has to cover the chunk scan. Reading it first would leave every
@@ -1081,12 +1092,12 @@ def test_an_unnamed_run_records_nothing(factory_calls):
 # ---------------------------------------------------------------------------
 
 
-def test_records_progress_after_every_chunk(factory_calls):
+def test_records_progress_for_every_committed_chunk(factory_calls):
     dblog = dumping(factory_calls, chunk_size=2)
     dblog._connector.row_script = [sales(1, 2), sales(3)]
     dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
 
-    full_run(dblog, from_lsn=lsn(10))
+    committing_run(dblog, from_lsn=lsn(10))
 
     assert [(save.chunk_key, save.done) for save in dblog._store.saves] == [
         (3, False),
@@ -1099,7 +1110,7 @@ def test_what_it_records_is_enough_to_resume_on(factory_calls):
     dblog._connector.row_script = [sales(1, 2)]
     dblog._connector.max_lsn_script = [lsn(200)]
 
-    full_run(dblog, from_lsn=lsn(10))
+    committing_run(dblog, from_lsn=lsn(10))
 
     first = dblog._store.saves[0]
     assert first.dump == "sales-backfill"
@@ -1108,19 +1119,88 @@ def test_what_it_records_is_enough_to_resume_on(factory_calls):
     assert first.chunk_key == 3
 
 
-def test_records_progress_only_once_the_frames_are_taken(factory_calls):
+def test_a_run_records_nothing_on_its_own(factory_calls):
     """
-    Recording before the consumer has the frames would turn a crash into silent
-    loss: the resume would skip a chunk nobody ever received.
+    Recording on the strength of a frame having been received would turn a failed
+    write into silent loss: the resume would skip rows the consumer never kept.
     """
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2), sales(3, 4)]
+    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+
+    full_run(dblog, from_lsn=lsn(10))
+
+    assert dblog._store.saves == []
+
+
+def test_an_uncommitted_run_is_read_again_from_the_start(factory_calls):
+    """The consumer's write failed, so the rows have to come round again."""
+    store = StubStore()
+
+    first = DBLog(**CONNECTION, chunk_size=2, state_store=store)
+    first._connector.row_script = [sales(1, 2), sales(3)]
+    first._connector.max_lsn_script = [lsn(200), lsn(300)]
+    list(first.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10)))
+
+    second = DBLog(**CONNECTION, chunk_size=2, state_store=store)
+    second._connector.row_script = [sales(1, 2)]
+    second._connector.max_lsn_script = [lsn(400)]
+    list(second.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10)))
+
+    assert second._connector.read_table_calls[0][1] is None
+
+
+def test_commit_records_nothing_before_a_run_has_started(factory_calls):
+    """Consumer code that commits unconditionally must not need a guard."""
+    dblog = DBLog(**CONNECTION, state_store=StubStore())
+
+    dblog.commit()
+
+    assert dblog._store.saves == []
+
+
+def test_commit_records_nothing_for_a_run_with_no_dump(factory_calls):
+    """There is no name to key progress under; such a caller keeps last_lsn itself."""
+    dblog = DBLog(**CONNECTION, state_store=StubStore())
+    dblog._connector.max_lsn = lsn(200)
+
+    drain(dblog, from_lsn=lsn(10))
+    dblog.commit()
+
+    assert dblog._store.saves == []
+
+
+def test_committing_twice_records_the_same_position(factory_calls):
+    """It snapshots where the run is, so an extra call cannot advance anything."""
     dblog = dumping(factory_calls, chunk_size=2)
     dblog._connector.row_script = [sales(1, 2), sales(3, 4)]
     dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
 
     stream = dblog.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))
     next(stream)
+    dblog.commit()
+    dblog.commit()
 
-    assert dblog._store.saves == []
+    assert len(dblog._store.saves) == 2
+    assert dblog._store.saves[0].model_dump() == dblog._store.saves[1].model_dump()
+
+
+def test_a_commit_after_the_run_records_the_finished_dump(factory_calls):
+    """
+    A dump ends on an iteration that yields nothing — the page came back empty — so
+    the ``done`` flag has no frame to ride out on. A caller that commits once more
+    after the loop records it, and spares the next run a read that finds nothing.
+    """
+    dblog = dumping(factory_calls, chunk_size=2)
+    dblog._connector.row_script = [sales(1, 2)]
+    dblog._connector.max_lsn_script = [lsn(200)]
+
+    committing_run(dblog, from_lsn=lsn(10))
+    assert dblog._store.saves[-1].done is False
+
+    dblog.commit()
+
+    assert dblog._store.saves[-1].done is True
 
 
 def test_resumes_the_table_walk_where_it_stopped(factory_calls):
@@ -1209,7 +1289,7 @@ def test_a_finished_dump_keeps_recording_where_the_log_reached(factory_calls):
     dblog._connector.event_script = [events(9)]
     dblog._connector.max_lsn_script = [lsn(600), lsn(700)]
 
-    full_run(dblog)
+    committing_run(dblog)
 
     assert dblog._store.saves[-1].last_lsn == lsn(601)
     assert dblog._store.saves[-1].done is True
@@ -1223,7 +1303,8 @@ def test_an_interrupted_dump_picks_up_from_its_last_record(factory_calls):
     first._connector.row_script = [sales(1, 2), sales(3, 4)]
     first._connector.max_lsn_script = [lsn(200), lsn(300)]
     stream = first.run("dbo", "sales", dump="sales-backfill", from_lsn=lsn(10))
-    taken = [next(stream), next(stream)]  # one chunk through, then "crash"
+    taken = [next(stream)]
+    first.commit()  # the first chunk was written; the next one "crashes"
     stream.close()
 
     second = DBLog(**CONNECTION, chunk_size=2, state_store=store)

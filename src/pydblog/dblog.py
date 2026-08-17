@@ -210,15 +210,36 @@ class DBLog:
             f"floor={floor.hex()} capture_instance={spec.capture_instance}"
         )
 
-    def _checkpoint(self) -> None:
+    def commit(self) -> None:
         """
         Record how far the dump has got, so an interruption costs one chunk.
+
+        Call this once the frames yielded so far are durably written, and not
+        before: it is the caller's declaration that those frames will not need to be
+        read again. A run records nothing on its own, so frames that were received
+        but never committed are read again on the next run under the same dump name
+        — which is the point. Committing on the strength of having merely received a
+        frame gives that guarantee up, since a downstream write can still fail after
+        the frame is in hand, and the rows behind the recorded position are then
+        unreachable: past ``chunk_key`` for the table, past ``last_lsn`` for the log.
 
         The table position and the log position go down together: a resume needs both
         to agree, and either one on its own would leave rows that neither the
         remaining chunks nor the remaining log would deliver.
 
-        Does nothing for a run with no dump to record against.
+        Records the position reached by every frame yielded so far, not one frame in
+        particular, so committing per frame and committing per batch of them are both
+        sound — the difference is only how much is re-read after a failure.
+
+        Worth one call after the loop as well as inside it: a dump ends on an
+        iteration that yields nothing, the page having come back empty, so the flag
+        marking it finished has no frame to ride out on. Without that last call the
+        dump is never recorded as done and the next run re-reads the empty page to
+        find out for itself, which costs a round trip but no correctness.
+
+        Does nothing for a run with no dump to record progress under, and nothing
+        before a run has started, so a consumer handling both kinds of run can call
+        it unconditionally.
         """
 
         if self._dump is None or self._spec is None or self._last_lsn is None:
@@ -259,11 +280,16 @@ class DBLog:
         A dump run alternates the two: a chunk of rows, then the log window that
         brackets reading it. Each iteration yields a single frame combining the
         window's events with the chunk's rows, minus whatever the window supersedes,
-        window events ordered first. It ends when the table runs out. Progress is
-        recorded after each chunk, so a run cut short by a lost
-        connection resumes at the chunk it was on rather than at the start of the
-        table; re-running the same name once the table is done skips the chunks and
-        tails the log instead.
+        window events ordered first. It ends when the table runs out.
+
+        A run records no progress by itself: the caller calls ``commit`` once it has
+        durably written what it was handed, and that is what a later run under the
+        same name resumes from. Frames received but never committed are read again,
+        so a run cut short by a lost connection — or by the caller's own write
+        failing — costs the uncommitted chunks and nothing more. A run whose frames
+        are never committed starts over from the beginning of the table.
+        Re-running a name whose table is done skips the chunks and tails the log
+        instead.
 
         A run with no dump reads one window, from ``from_lsn`` to wherever the log's
         end is at that moment, and stops — it does not loop internally until caught
@@ -330,18 +356,11 @@ class DBLog:
                 elif window is not None:
                     yield window
 
-                # After the yields, not before: this line only runs once the consumer
-                # comes back for more, which is the only evidence there is that it
-                # took what the iteration produced. Recording first would let a crash
-                # skip a chunk nobody ever received.
-                self._checkpoint()
-
             return
 
         events = self._read_window()
         if events is not None:
             yield events
-            self._checkpoint()
 
     def _supersede(self, chunk: DataFrame, window: DataFrame | None) -> DataFrame:
         """

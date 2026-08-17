@@ -4,10 +4,10 @@ Streams a SQL Server table's changes, optionally interleaved with a chunked dump
 its rows, using the [DBLog](https://arxiv.org/abs/2010.12597) algorithm over CDC.
 
 A run yields polars DataFrames. Every frame shares one schema — change events and
-dump rows alike — so a whole run stacks with `pl.concat` and no reconciliation:
+dump rows alike — so no frame needs reconciling against another. You write each one
+and commit, and the commit is what a later run resumes from:
 
 ```python
-import polars as pl
 from pydblog.dblog import DBLog
 
 with DBLog(
@@ -16,17 +16,28 @@ with DBLog(
     user="sa", password="...", database="dblog_lab",
     chunk_size=1000,
 ) as dblog:
-    frames = list(dblog.run("dbo", "sales", dump="sales-backfill"))
+    for frame in dblog.run("dbo", "sales", dump="sales-backfill"):
+        frame.write_delta("s3://lake/sales", mode="append")
+        dblog.commit()  # only now is that frame's position recorded
 
-everything = pl.concat(frames)
+    dblog.commit()  # once more, to record the dump as finished
 ```
+
+Because every frame shares one schema, a whole run also stacks with
+`pl.concat(frames)` if you would rather collect it — but collecting first means
+nothing is durably written until the end, so commit once the write is done, not
+once the frames are in memory.
 
 Rows that came off the table rather than out of the log are marked with an all-zero
 `start_lsn` and `operation = 0`, a position CDC never issues.
 
-Naming a `dump` makes the run walk the table as well as the log, and records progress
-under that name so an interrupted run resumes at the chunk it was on. Leaving it out
-drains the change log only, and then requires a `from_lsn`.
+Naming a `dump` makes the run walk the table as well as the log, and gives `commit()`
+a name to record progress under, so an interrupted run resumes at the last chunk you
+committed. Leaving it out drains the change log only, and then requires a `from_lsn`.
+
+`commit()` is yours to call because only you know when the data is safe. A frame you
+received but never committed is read again on the next run; a position recorded before
+your write succeeded would put those rows out of reach for good.
 
 ## Requirements
 
@@ -90,7 +101,7 @@ drift.
 
 | Path | What lives there |
 | --- | --- |
-| `src/pydblog/dblog.py` | The algorithm: chunk, window, supersede, checkpoint |
+| `src/pydblog/dblog.py` | The algorithm: chunk, window, supersede, commit |
 | `src/pydblog/connectors/base.py` | The `SourceConnector` Protocol every source implements |
 | `src/pydblog/connectors/mssql/connector.py` | SQL Server: CDC reads, table reads, `inspect()` |
 | `src/pydblog/connectors/mssql/schema.py` | The SQL Server → Arrow type map, and the schema every frame is cast to |
