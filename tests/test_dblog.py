@@ -908,6 +908,30 @@ def test_events_for_rows_outside_the_chunk_change_nothing(factory_calls):
     assert merged["sale_id"].to_list() == [1, 2]
 
 
+def test_a_window_that_supersedes_nothing_hands_back_the_same_frame(factory_calls):
+    """
+    Not merely an equal frame — the same one. The anti-join would return these rows
+    unchanged while materialising every column to do it, which on a wide chunk costs
+    as much memory again as the chunk itself. Identity is the assertion because it is
+    the only one that fails if that copy comes back.
+    """
+    dblog = dumping(factory_calls)
+    chunk = sales(1, 2, 3)
+
+    assert dblog._supersede(chunk, events(90, 91)) is chunk
+
+
+def test_a_window_that_supersedes_something_still_rebuilds(factory_calls):
+    """The short circuit must not swallow a real overlap."""
+    dblog = dumping(factory_calls)
+    chunk = sales(1, 2, 3)
+
+    merged = dblog._supersede(chunk, events(2))
+
+    assert merged is not chunk
+    assert merged["sale_id"].to_list() == [1, 3]
+
+
 def test_the_merged_chunk_keeps_the_table_columns(factory_calls):
     """The window's metadata columns must not leak into the chunk's schema."""
     dblog = dumping(factory_calls)
