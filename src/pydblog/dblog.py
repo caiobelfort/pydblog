@@ -32,6 +32,102 @@ class CdcRetentionExpiredError(RuntimeError):
     """
 
 
+def _check_arguments(dump: str | None, from_lsn: LSN | None) -> None:
+    """
+    Refuse a run that cannot be started, before anything is built.
+
+    Neither of these needs the database to decide, so both are settled at construction
+    rather than on the first fetch, when a typo has already cost a round trip.
+
+    Raises:
+        ValueError: If ``dump`` is blank, or if neither a ``dump`` nor a ``from_lsn``
+            was given.
+    """
+
+    if dump is not None and not dump.strip():
+        raise ValueError("dump name is blank: it is the key progress is kept under")
+
+    if dump is None and from_lsn is None:
+        raise ValueError(
+            "a run with no dump needs from_lsn: with no chunks to establish "
+            "current state there is no safe default, since starting at the "
+            "retention floor replays history and starting at the present drops "
+            "it, and neither is visible to the caller"
+        )
+
+
+def _recorded(
+    store: StateStore, dump: str | None, spec: TableSpec
+) -> DumpState | None:
+    """
+    The progress recorded for a dump, if there is any to pick up.
+
+    Raises:
+        ValueError: If the dump last ran against a different table, whose chunk key is
+            a position in a key space this one does not share.
+    """
+
+    if dump is None:
+        return None
+
+    recorded = store.load(dump)
+    if recorded is not None and recorded.table != spec.qualified_name:
+        raise ValueError(
+            f"dump {dump!r} last ran against {recorded.table}, not "
+            f"{spec.qualified_name}: its chunk key is a position in a key space "
+            "this table does not share"
+        )
+
+    return recorded
+
+
+def _opening_lsn(
+    connector: SourceConnector,
+    spec: TableSpec,
+    dump: str | None,
+    from_lsn: LSN | None,
+    recorded: DumpState | None,
+    floor: LSN,
+) -> LSN:
+    """
+    Where the run's first window opens.
+
+    Recorded progress wins over anything the caller suggests: its chunk key and its LSN
+    were written together and only mean anything together, so honouring a ``from_lsn``
+    against a resumed chunk key would leave a gap between them. Failing that an
+    explicit ``from_lsn`` wins, and failing that a dump opens at the present, because
+    its chunks carry the table as it is now and replaying the log's whole retention
+    window would be work that changes nothing.
+
+    A run with no dump has been made to supply a ``from_lsn`` by now, so the last case
+    is the floor only in principle.
+
+    Raises:
+        CdcRetentionExpiredError: If the position lands below what the log retains.
+    """
+
+    if recorded is not None:
+        opening = recorded.last_lsn
+    elif from_lsn is not None:
+        opening = from_lsn
+    elif dump is not None:
+        # The floor matters here: a capture instance enabled moments ago has a start
+        # LSN the database-wide max has not reached, and opening at the bare max would
+        # sit below what the log retains.
+        opening = max(connector.get_max_lsn(), floor)
+    else:
+        opening = floor
+
+    if opening < floor:
+        raise CdcRetentionExpiredError(
+            f"{spec.qualified_name} no longer retains {opening.hex()}: the log "
+            f"starts at {floor.hex()}. The gap cannot be read, so the table has "
+            "to be dumped again."
+        )
+
+    return opening
+
+
 class DBLog:
     """
     Interleaves a chunked table dump with the ongoing change event log.
@@ -104,18 +200,7 @@ class DBLog:
         if chunk_size < 1:
             raise ValueError(f"chunk_size must be at least 1, got {chunk_size}")
 
-        # Both of these are decidable without touching the source, so they are settled
-        # now rather than on the first fetch, when a typo has already cost a round trip.
-        if dump is not None and not dump.strip():
-            raise ValueError("dump name is blank: it is the key progress is kept under")
-
-        if dump is None and from_lsn is None:
-            raise ValueError(
-                "a run with no dump needs from_lsn: with no chunks to establish "
-                "current state there is no safe default, since starting at the "
-                "retention floor replays history and starting at the present drops "
-                "it, and neither is visible to the caller"
-            )
+        _check_arguments(dump, from_lsn)
 
         if verbose:
             configure_logging(verbose=True)
@@ -219,7 +304,6 @@ class DBLog:
                 retention floor.
         """
 
-        dump, from_lsn = self._dump, self._from_lsn
         spec = self._connector.inspect(self._schema, self._table)
         if spec.capture_instance is None:
             raise ValueError(
@@ -227,33 +311,11 @@ class DBLog:
                 "change log from"
             )
 
-        recorded = self._store.load(dump) if dump is not None else None
-        if recorded is not None and recorded.table != spec.qualified_name:
-            raise ValueError(
-                f"dump {dump!r} last ran against {recorded.table}, not "
-                f"{spec.qualified_name}: its chunk key is a position in a key space "
-                "this table does not share"
-            )
-
         floor = self._connector.get_min_lsn(spec.capture_instance)
-        if recorded is not None:
-            start = recorded.last_lsn
-        elif from_lsn is not None:
-            start = from_lsn
-        elif dump is not None:
-            # The floor matters here: a capture instance enabled moments ago has a
-            # start LSN the database-wide max has not reached, and opening at the bare
-            # max would sit below what the log retains.
-            start = max(self._connector.get_max_lsn(), floor)
-        else:
-            start = floor
-
-        if start < floor:
-            raise CdcRetentionExpiredError(
-                f"{spec.qualified_name} no longer retains {start.hex()}: the log "
-                f"starts at {floor.hex()}. The gap cannot be read, so the table has "
-                "to be dumped again."
-            )
+        recorded = _recorded(self._store, self._dump, spec)
+        start = _opening_lsn(
+            self._connector, spec, self._dump, self._from_lsn, recorded, floor
+        )
 
         self._spec = spec
         self._last_lsn = start
@@ -262,7 +324,7 @@ class DBLog:
 
         logger.info(
             f"started {'resumed ' if recorded is not None else ''}run on "
-            f"{spec.qualified_name} dump={dump} from_lsn={start.hex()}"
+            f"{spec.qualified_name} dump={self._dump} from_lsn={start.hex()}"
         )
         logger.debug(
             f"run state: chunk_key={self._chunk_key} dump_done={self._dump_done} "

@@ -46,7 +46,7 @@ Each is unremarkable alone; the shape only makes sense together.
 
 ```
 one call, one batch:
-  seed once             # _start(): inspect + store read, skipped if the run matches
+  seed once             # _start(): inspect + store read, only on the first fetch
   _window_low = get_max_lsn()      # before-watermark, for dating this chunk only
   chunk  = _next_chunk()           # keyset page from _chunk_key
   window = _read_window()          # (_last_lsn, get_max_lsn()], then _last_lsn = high+1
