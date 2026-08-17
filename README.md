@@ -15,34 +15,32 @@ with DBLog(
     source_type="mssql",
     host="localhost", port="1433",
     user="sa", password="...", database="dblog_lab",
+    schema="dbo", table="sales", dump="sales-backfill",
     chunk_size=1000,
 ) as dblog:
-    while (frame := dblog.fetch("dbo", "sales", dump="sales-backfill")) is not None:
+    while (frame := dblog.fetch()) is not None:
         frame.write_delta("s3://lake/sales", mode="append")
         dblog.commit()  # only now is that batch's position recorded
 ```
+
+An instance is one run. The table and the dump identify the run rather than any batch
+of it, so they are constructor arguments and `fetch()` takes none: reading a second
+table, or the same table under a second dump name, is a second `DBLog`.
 
 Nothing is buffered and nothing is lazy: the batch is read by the call, and its size
 is bounded by `chunk_size` however large the table is. The first call inspects the
 table and loads whatever progress is recorded; the rest just advance.
 
 That loop runs until the table is walked *and* the log is caught up. To stop at the
-end of the table instead — a backfill rather than a tail — stop on `dump_done`:
+end of the table instead — a backfill rather than a tail — loop on `dump_done`:
 
 ```python
-while True:
-    frame = dblog.fetch("dbo", "sales", dump="sales-backfill")
+while not dblog.dump_done:
+    frame = dblog.fetch()
     if frame is not None:
         frame.write_delta("s3://lake/sales", mode="append")
         dblog.commit()
-
-    if dblog.dump_done:
-        break
 ```
-
-Fetch first and ask `dump_done` after, not the other way round: a dump is only
-seeded once `fetch()` has named it, so beforehand the flag still describes whatever
-that instance ran last — and testing it up front would skip the new dump entirely.
 
 Rows that came off the table rather than out of the log are marked with an all-zero
 `start_lsn` and `operation = 0`, a position CDC never issues.
@@ -53,9 +51,14 @@ committed. Leaving it out reads the change log only, and then requires a `from_l
 
 `commit()` is yours to call because only you know when the data is safe. A frame you
 received but never committed is read again on the next run; a position recorded before
-your write succeeded would put those rows out of reach for good. Commit once more
-after the loop to record the dump as finished — the batch that discovers the end of
-the table is the one that comes back empty, so `done` has no frame to ride out on.
+your write succeeded would put those rows out of reach for good.
+
+Worth one `commit()` after the loop as well as inside it. A short chunk ends the dump
+and arrives as a frame, so committing that frame records the dump as finished — but
+when the row count is an exact multiple of `chunk_size` there is no short chunk, and
+the end is found by a batch that comes back empty with nothing to commit alongside.
+Skipping that last call costs the next run one empty read to rediscover the end, and
+nothing else.
 
 ## Requirements
 

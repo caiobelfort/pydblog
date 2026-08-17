@@ -61,12 +61,16 @@ end of the table a batch is a window alone, so a plain `while fetch() is not Non
 slides from dumping into tailing — `dump_done` is there for a caller that wants to
 stop at the end of the table instead.
 
-**`dump_done` is about the run that is seeded, so fetch before you ask it.** A dump is
-not seeded until `fetch()` names it, and `_start()` is what resets the flag. Testing it
-first — `while not dblog.dump_done:` — reads the *previous* dump's state, and on a
-reused `DBLog` that means the loop never runs and the new dump returns nothing. This
-bit the integration fixtures, which share one module-scoped instance across two dumps;
-`test_a_finished_dump_does_not_bound_the_next_one` pins it.
+**An instance is one run.** `schema`, `table`, `dump` and `from_lsn` are constructor
+arguments, so `fetch()` takes none: they identify the run, not a batch of it. A second
+table or a second dump name is a second `DBLog` — which is why the integration fixture
+is a factory rather than one shared instance.
+
+That is also what makes `while not dblog.dump_done:` safe to write. It was not, back
+when `fetch()` took the dump name per call: the flag described whichever dump was last
+seeded, so a finished dump left it True and the next dump's loop never ran at all.
+`test_a_finished_dump_does_not_bound_a_dump_on_another_instance` pins that it starts
+False per instance.
 
 The window closes *after* the chunk scan, so anything committed during the scan lands
 inside it and the chunk cannot carry a stale row the window does not also correct.

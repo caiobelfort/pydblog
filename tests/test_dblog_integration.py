@@ -48,19 +48,31 @@ class MemoryStore:
 
 
 @pytest.fixture(scope="module")
-def dblog(sqlserver) -> DBLog:
+def dblog(sqlserver):
+    """
+    Builds a DBLog on the lab table for a named dump.
+
+    A factory rather than one instance, because an instance is one run: the dump is
+    fixed at construction, so the two runs below need one each.
+    """
     store: StateStore = MemoryStore()
 
-    return DBLog(
-        source_type="mssql",
-        host=sqlserver.get_container_host_ip(),
-        port=str(sqlserver.get_exposed_port(1433)),
-        user="sa",
-        password=SA_PASSWORD,
-        database=DATABASE,
-        chunk_size=2,
-        state_store=store,
-    )
+    def build(dump: str) -> DBLog:
+        return DBLog(
+            source_type="mssql",
+            host=sqlserver.get_container_host_ip(),
+            port=str(sqlserver.get_exposed_port(1433)),
+            user="sa",
+            password=SA_PASSWORD,
+            database=DATABASE,
+            schema=LAB_SCHEMA,
+            table=LAB_TABLE,
+            dump=dump,
+            chunk_size=2,
+            state_store=store,
+        )
+
+    return build
 
 
 @pytest.fixture(scope="module")
@@ -74,13 +86,12 @@ def dumped(dblog, connector, spec) -> list[DataFrame]:
 
     Module-scoped: one run answers every question below, and a dump run is not cheap.
     """
+    run = dblog("concat-proof")
     frames: list[DataFrame] = []
     written = False
 
-    # Fetch first, then ask whether the table is walked: dump_done still describes
-    # whatever ran before until this dump's first fetch seeds it.
-    while True:
-        frame = dblog.fetch(LAB_SCHEMA, LAB_TABLE, dump="concat-proof")
+    while not run.dump_done:
+        frame = run.fetch()
         if frame is not None:
             frames.append(frame)
 
@@ -103,8 +114,7 @@ def dumped(dblog, connector, spec) -> list[DataFrame]:
             )
             wait_for_cdc(connector, spec.capture_instance, before)
 
-        if dblog.dump_done:
-            return frames
+    return frames
 
 
 @pytest.mark.integration
@@ -202,7 +212,8 @@ def raced(dblog, connector, spec) -> Raced:
         [target],
     )
 
-    original = dblog._connector.read_table
+    run = dblog("race-proof")
+    original = run._connector.read_table
     fired: list[int] = []
 
     def read_then_write(*args, **kwargs):
@@ -216,19 +227,15 @@ def raced(dblog, connector, spec) -> Raced:
             fired.append(target)
         return rows
 
-    dblog._connector.read_table = read_then_write
+    run._connector.read_table = read_then_write
     try:
-        # Fetch first, then ask: this instance already finished "concat-proof", so
-        # dump_done is still True from that one until this dump's first fetch.
         frames = []
-        while True:
-            frame = dblog.fetch(LAB_SCHEMA, LAB_TABLE, dump="race-proof")
+        while not run.dump_done:
+            frame = run.fetch()
             if frame is not None:
                 frames.append(frame)
-            if dblog.dump_done:
-                break
     finally:
-        dblog._connector.read_table = original
+        run._connector.read_table = original
 
     return Raced(
         fired=bool(fired),
