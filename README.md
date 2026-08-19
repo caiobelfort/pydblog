@@ -70,6 +70,22 @@ guarantee the algorithm already makes. Where the state lives, and when to dump t
 again, are yours: `RunState` is a pydantic model, so `model_dump_json()` and
 `RunState.model_validate_json()` are all a file or a row needs.
 
+When the position comes from somewhere other than a previous call — a state that was lost
+but whose LSN was written down elsewhere, a handoff from another tool, a deliberate replay
+of a window of the log — build the state instead of passing `None`:
+
+```python
+from pydblog.dblog import state_at_lsn
+
+state = state_at_lsn(source, "dbo", "sales", from_lsn=recorded_elsewhere)
+result = dblog(source, "dbo", "sales", state=state)   # reads the log, no table walk
+```
+
+It is a function rather than a `from_lsn` argument because a state needs the table's
+spec, and a spec needs an `inspect()` — done once here, so the call that uses the state
+does not repeat it. Pass `dump_done=False` to walk the table as well, which replays the
+log from that position alongside the chunks.
+
 The state carries the table's spec as `inspect()` described it, which is what settles
 the schema every frame shares. `dblog()` re-reads that spec once a day by default
 (`inspect_every`) and stops the run with `SchemaChangedError` if the capture instance

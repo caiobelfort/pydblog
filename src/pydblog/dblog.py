@@ -105,6 +105,77 @@ def _seed(connector: SourceConnector, schema: str, table: str) -> RunState:
     return RunState(spec=spec, last_lsn=opening, last_inspect=datetime.now(UTC))
 
 
+def state_at_lsn(
+    connector: SourceConnector,
+    schema: str,
+    table: str,
+    from_lsn: LSN,
+    dump_done: bool = True,
+) -> RunState:
+    """
+    Build a state that opens at a position the caller already knows.
+
+    ``dblog()`` has one default — no state means dump the table from the present — and
+    that is the right one for a stream nobody has read before. This is for the cases
+    where the position comes from somewhere else: a run whose state was lost but whose
+    LSN was written down elsewhere, a handoff from another tool, a deliberate replay of
+    a window of the log.
+
+    It exists as a function rather than as an argument to ``dblog()`` because a state
+    needs the table's spec, and a spec needs an ``inspect()``. Constructing a
+    ``RunState`` by hand is possible but means reproducing that read; this does it once,
+    and everything after is an ordinary threaded state.
+
+    ```python
+    state = state_at_lsn(source, "dbo", "sales", from_lsn=recorded_elsewhere)
+    result = dblog(source, "dbo", "sales", state=state)
+    ```
+
+    Args:
+        connector: The source to read from, already connected.
+        schema: Schema of the table to read.
+        table: Name of the table to read.
+        from_lsn: Where the first window opens. Inclusive, so an event sitting exactly
+            on it is read.
+        dump_done: Whether to treat the table as already walked, which is the usual
+            reason to be here: the log alone, from a known position. False walks the
+            table from the start as well, which replays the log from ``from_lsn``
+            alongside the chunks — the chunks carry the table as it is now, so anything
+            between that position and the present arrives from the log rather than
+            being lost.
+
+    Returns:
+        A state ready to pass to ``dblog()``, carrying the spec so that call does not
+        inspect the table again.
+
+    Raises:
+        ValueError: If the table has no capture instance to read a log from.
+        CdcRetentionExpiredError: If the position is below what the log retains. Refused
+            here rather than on the first call, since the caller chose it here.
+    """
+
+    spec = connector.inspect(schema, table)
+    capture_instance = _require_capture_instance(spec)
+
+    # A position the source has not reached yet is fine — that is the steady state of an
+    # idle database, and the first window simply reads nothing. Only one below the floor
+    # is unusable, and it is unusable for good.
+    built = RunState(
+        spec=spec,
+        last_lsn=from_lsn,
+        last_inspect=datetime.now(UTC),
+        dump_done=dump_done,
+    )
+    _check_retention(connector, built, capture_instance)
+
+    logger.info(
+        f"built a state on {spec.qualified_name} at {from_lsn.hex()} with the table "
+        f"{'already walked' if dump_done else 'still to walk'}"
+    )
+
+    return built
+
+
 def _check_table(state: RunState, schema: str, table: str) -> None:
     """
     Refuse a state that belongs to another table.

@@ -89,6 +89,12 @@ Two consequences worth knowing before changing anything here:
 caller whose state load quietly returned `None` re-dumps everything; their bug, but an
 expensive enough one to say out loud.
 
+**`state_at_lsn()`** is the only other way to get a first state: it inspects the table and
+returns a state opening at a position the caller already knows, `dump_done=True` by
+default. It is a function and not a `from_lsn` argument on `dblog()` on purpose — such an
+argument would be meaningful only when `state is None` and ignored otherwise, which is
+the conditional-argument shape the rewrite removed. Do not add it back.
+
 The window closes *after* the chunk scan, so anything committed during the scan lands
 inside it and the chunk cannot carry a stale row the window does not also correct.
 Windows are half-open via `increment_lsn`, because the CDC read is inclusive on both

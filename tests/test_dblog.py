@@ -23,6 +23,7 @@ from pydblog.dblog import (
     _read_window,
     _supersede,
     dblog,
+    state_at_lsn,
 )
 from pydblog.state import RunState
 
@@ -1072,6 +1073,126 @@ def test_a_fresh_run_after_an_expired_one_opens_above_the_floor(source):
     result = dblog(source, **TARGET, chunk_size=2)
 
     assert result.state.last_lsn >= lsn(5000)
+
+
+# ---------------------------------------------------------------------------
+# state_at_lsn — a state built from a position the caller already knows
+# ---------------------------------------------------------------------------
+
+
+def test_a_state_built_from_an_lsn_opens_the_window_there(source):
+    source.max_lsn = lsn(900)
+
+    built = state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+    dblog(source, **TARGET, state=built)
+
+    assert source.event_log_calls == [(SPEC, lsn(500), lsn(900))]
+
+
+def test_a_state_built_from_an_lsn_needs_no_further_seeding(source):
+    """It carries the spec, so the call that uses it does not inspect again."""
+    built = state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+
+    dblog(source, **TARGET, state=built)
+
+    assert source.inspect_calls == [("dbo", "sales")]
+
+
+def test_a_state_built_from_an_lsn_reads_the_log_alone(source):
+    """
+    The default, and the case it exists for: a caller who knows a position and wants
+    the log from there, with no table walk in front of it.
+    """
+    source.max_lsn = lsn(900)
+
+    built = state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+    dblog(source, **TARGET, state=built)
+
+    assert built.dump_done is True
+    assert source.read_table_calls == []
+
+
+def test_a_state_built_from_an_lsn_can_dump_as_well(source):
+    """
+    Which replays the log from an earlier position alongside the table walk: the chunks
+    carry the table as it is now, so anything between that position and the present
+    arrives from the log rather than being lost.
+    """
+    source.rows = sales(1, 2, 3)
+    source.max_lsn = lsn(900)
+
+    built = state_at_lsn(source, **TARGET, from_lsn=lsn(500), dump_done=False)
+    dblog(source, **TARGET, state=built, chunk_size=3)
+
+    assert built.chunk_key is None  # from the start of the table
+    assert source.read_table_calls[0][1] is None
+    assert source.event_log_calls == [(SPEC, lsn(500), lsn(900))]
+
+
+def test_building_a_state_inspects_the_table_it_was_asked_for(source):
+    state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+
+    assert source.inspect_calls == [("dbo", "sales")]
+
+
+def test_building_a_state_stamps_when_it_inspected(source):
+    before = datetime.now(UTC)
+
+    built = state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+
+    assert before <= built.last_inspect <= datetime.now(UTC)
+
+
+def test_building_a_state_refuses_a_table_that_is_not_captured(source):
+    source.spec = SPEC.model_copy(update={"capture_instance": None})
+
+    with pytest.raises(ValueError, match="capture instance"):
+        state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+
+
+def test_building_a_state_refuses_a_position_that_aged_out(source):
+    """
+    Refused here rather than on the first call: the caller chose this position, so the
+    complaint belongs where they chose it.
+    """
+    source.min_lsn = lsn(900)
+
+    with pytest.raises(CdcRetentionExpiredError, match="dbo.sales"):
+        state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+
+
+def test_building_a_state_accepts_a_position_exactly_on_the_floor(source):
+    source.min_lsn = lsn(500)
+
+    built = state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+
+    assert built.last_lsn == lsn(500)
+
+
+def test_a_position_the_source_has_not_reached_is_not_an_error(source):
+    """The steady state of an idle database, and a legitimate place to wait at."""
+    source.max_lsn = lsn(100)
+    source.min_lsn = lsn(1)
+
+    built = state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+    result = dblog(source, **TARGET, state=built)
+
+    assert result.frame is None
+    assert result.state.last_lsn == lsn(500)
+
+
+def test_a_built_state_round_trips_through_json(source):
+    built = state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+
+    assert RunState.model_validate_json(built.model_dump_json()) == built
+
+
+def test_building_a_state_says_nothing_about_dumping(source, caplog):
+    """It is not a fresh dump, so the warning that names one would be a lie."""
+    with caplog.at_level("WARNING"):
+        state_at_lsn(source, **TARGET, from_lsn=lsn(500))
+
+    assert caplog.text == ""
 
 
 # ---------------------------------------------------------------------------

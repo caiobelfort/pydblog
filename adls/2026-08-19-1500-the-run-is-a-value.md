@@ -154,13 +154,15 @@ nothing serializing the state should ever try to carry.
 - **Breaking, and loudly so.** `DBLog` no longer exists, so every call site is an
   `ImportError` rather than a silent change of meaning. `commit()` is gone; there is
   nothing to call and nowhere it wrote to.
-- **A capability was removed, not moved.** A run reading the log alone from a
-  caller-chosen LSN — `dump=None, from_lsn=X` — has no equivalent. Every stream now
-  begins with a dump, and a tail is what a finished dump's state becomes. The old
-  `from_lsn` was also the only way to replay log history from before the present, and
-  that goes with it. Restoring either means hand-constructing a `RunState`, which needs
-  a spec, which needs an `inspect()` — so if a caller ever wants it, the right shape is a
-  small public helper, not a resurrected argument.
+- **`from_lsn` came back as a function, not an argument.** A run reading the log alone
+  from a caller-chosen LSN — the old `dump=None, from_lsn=X` — is
+  `state_at_lsn(connector, schema, table, from_lsn=X)`, and the old `dump=True,
+  from_lsn=X` (replay the log from an earlier point while walking the table) is the same
+  call with `dump_done=False`. It is a function because a state needs a spec and a spec
+  needs an `inspect()`; putting it back on `dblog()` would mean an argument that is
+  meaningful only when `state is None` and silently ignored otherwise, which is exactly
+  the conditional-argument shape this rewrite removed. The ordinary path still has one
+  default and no flags: no state means dump the table from the present.
 - **The default state file is gone.** `JsonFileStore` wrote to `.pydblog-state` in the
   working directory by default, which was a landmine in any process whose cwd was not
   what its author assumed. Persistence is now visibly the caller's, and
