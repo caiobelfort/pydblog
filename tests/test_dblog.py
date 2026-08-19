@@ -1,38 +1,33 @@
 """
-DBLog orchestrator tests.
+DBLog algorithm tests.
 
-None of this needs a database. ``DBLog`` only ever talks to the ten primitives of
-the ``SourceConnector`` Protocol, so a stub implementing that Protocol is enough to
-assert the orchestration — which is the point of typing the attribute as the
-Protocol rather than as ``MSSQLConnector``.
+None of this needs a database. ``dblog()`` only ever talks to the primitives of the
+``SourceConnector`` Protocol, so a stub implementing that Protocol is enough to assert
+the orchestration — which is the point of typing the argument as the Protocol rather
+than as ``MSSQLConnector``.
 
-Whether those primitives actually work against SQL Server is ``test_mssql.py``'s
-job, and it is already answered there.
+Whether those primitives actually work against SQL Server is ``test_mssql.py``'s job,
+and it is already answered there.
 """
 
-import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from polars import Binary, DataFrame, Datetime, Int32, all, lit
 
-import pydblog.dblog
 from pydblog.connectors.types import LSN, ColumnSpec, TableSpec
-from pydblog.dblog import DEFAULT_CHUNK_SIZE, CdcRetentionExpiredError, DBLog
-from pydblog.state import DumpState
+from pydblog.dblog import (
+    CdcRetentionExpiredError,
+    SchemaChangedError,
+    _next_chunk,
+    _read_window,
+    _supersede,
+    dblog,
+)
+from pydblog.state import RunState
 
-CONNECTION = {
-    "source_type": "mssql",
-    "host": "localhost",
-    "port": "1433",
-    "user": "sa",
-    "password": "p",
-    "database": "dblog_lab",
-}
-
-# The run identity, which the constructor takes and the connector never sees.
+# The table every test reads, named the way a caller names it.
 TARGET = {"schema": "dbo", "table": "sales"}
-
 
 COLUMNS = [
     ColumnSpec(name="sale_id", type_name="int", precision=10, scale=0),
@@ -48,6 +43,16 @@ SPEC = TableSpec(
     capture_instance="dbo_sales",
 )
 
+# A column added to the source. CDC keeps the set its capture instance was created
+# with, so which of the two lists it lands in is the whole difference between a warning
+# and a stopped run.
+WIDER = COLUMNS + [ColumnSpec(name="note", type_name="varchar", precision=0, scale=0)]
+
+SPEC_SOURCE_WIDENED = SPEC.model_copy(update={"columns": WIDER})
+SPEC_CAPTURE_WIDENED = SPEC.model_copy(
+    update={"columns": WIDER, "captured_columns": WIDER}
+)
+SPEC_REKEYED = SPEC.model_copy(update={"pk_columns": ["amount"]})
 
 COMMIT_TIME = datetime(2026, 8, 13, 12, 30)
 
@@ -61,9 +66,9 @@ class StubConnector:
     """
     A scriptable ``SourceConnector`` that records what the algorithm asked it.
 
-    ``max_lsn`` and ``events`` are what the next call returns; tests set them to
-    stage a scenario. The ``*_calls`` lists are what the algorithm actually asked
-    for, which is what the assertions are about.
+    ``max_lsn`` and ``events`` are what the next call returns; tests set them to stage
+    a scenario. The ``*_calls`` lists are what the algorithm actually asked for, which
+    is what the assertions are about.
     """
 
     def __init__(self, **kwargs) -> None:
@@ -74,10 +79,11 @@ class StubConnector:
         self.min_lsn: LSN = lsn(1)
         self.spec: TableSpec | None = None
         self.events: DataFrame | None = None
-        # Scripts, for when one call is not enough: each drains one entry per call
-        # and the source stops moving once it runs dry.
+        # Scripts, for when one call is not enough: each drains one entry per call and
+        # the source stops moving once it runs dry.
         self.max_lsn_script: list[LSN] = []
         self.event_script: list[DataFrame | None] | None = None
+        self.spec_script: list[TableSpec] | None = None
         self.rows: DataFrame = DataFrame()
         self.row_script: list[DataFrame] | None = None
         self.event_log_calls: list[tuple[TableSpec, LSN, LSN]] = []
@@ -86,8 +92,8 @@ class StubConnector:
         self.watermarks: list[datetime] = []
         self.awaited: list[datetime] = []
         self.to_events_calls: list[tuple[DataFrame, datetime | None]] = []
-        # Every read in the order it happened. The interleave is as much about
-        # sequence as about results: the window has to close after the chunk scan.
+        # Every read in the order it happened. The interleave is as much about sequence
+        # as about results: the window has to close after the chunk scan.
         self.calls: list[str] = []
 
     def connect(self) -> None:
@@ -95,6 +101,13 @@ class StubConnector:
 
     def close(self) -> None:
         self.closes += 1
+
+    def __enter__(self) -> "StubConnector":
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
 
     def get_max_lsn(self) -> LSN:
         if self.max_lsn_script:
@@ -106,6 +119,8 @@ class StubConnector:
 
     def inspect(self, schema: str, table: str) -> TableSpec:
         self.inspect_calls.append((schema, table))
+        if self.spec_script:
+            return self.spec_script.pop(0)
         return self.spec if self.spec is not None else SPEC
 
     def read_event_log(
@@ -164,673 +179,31 @@ class StubConnector:
         return lsn(int.from_bytes(value, "big") + 1)
 
 
-class StubStore:
-    """An in-memory StateStore, so tests never touch the filesystem."""
-
-    def __init__(self) -> None:
-        self.states: dict[str, DumpState] = {}
-        self.saves: list[DumpState] = []
-
-    def load(self, dump: str) -> DumpState | None:
-        return self.states.get(dump)
-
-    def save(self, state: DumpState) -> None:
-        self.states[state.dump] = state
-        self.saves.append(state)
-
-    def clear(self, dump: str) -> None:
-        self.states.pop(dump, None)
-
-
 @pytest.fixture
-def factory_calls(monkeypatch) -> list[dict]:
+def source() -> StubConnector:
+    """A stub source. Every test drives the algorithm against one of these."""
+    return StubConnector()
+
+
+def state(**overrides) -> RunState:
     """
-    Swap ``build_connector`` for one that yields stubs and records its arguments.
+    A state mid-run on dbo.sales, with the log read up to lsn(10).
 
-    Returns the list the calls land in; the stub itself is reachable through
-    ``DBLog._connector``.
+    ``last_inspect`` defaults to now, so an ordinary call does not re-inspect and the
+    call counts a test asserts on stay about what it drove. Tests about re-inspecting
+    pass an older one.
     """
-    calls: list[dict] = []
-
-    def fake_build_connector(**kwargs) -> StubConnector:
-        calls.append(kwargs)
-        return StubConnector(**kwargs)
-
-    monkeypatch.setattr(pydblog.dblog, "build_connector", fake_build_connector)
-    return calls
-
-
-def make(**overrides) -> DBLog:
-    """
-    A DBLog on dbo.sales, reading the log alone from lsn(10).
-
-    A run needs a dump or a from_lsn to be constructible at all, so one is defaulted
-    here to keep the common case a single call. Tests about where a run starts pass
-    their own; tests about dumps go through ``dumping``.
-    """
-    return DBLog(**CONNECTION, **TARGET, **{"from_lsn": lsn(10), **overrides})
-
-
-# ---------------------------------------------------------------------------
-# Construction — the connector comes from the factory, never from an import
-# ---------------------------------------------------------------------------
-
-
-def test_builds_its_connector_through_the_factory(factory_calls):
-    dblog = make()
-
-    assert factory_calls == [CONNECTION]
-    assert isinstance(dblog._connector, StubConnector)
-
-
-def test_passes_extra_arguments_through_to_the_factory(factory_calls):
-    make(application_name="pytest")
-
-    assert factory_calls[0]["application_name"] == "pytest"
-
-
-def test_chunk_size_does_not_reach_the_factory(factory_calls):
-    """It is the algorithm's knob, not the connection's."""
-    make(chunk_size=500)
-
-    assert "chunk_size" not in factory_calls[0]
-
-
-def test_chunk_size_defaults(factory_calls):
-    assert make()._chunk_size == DEFAULT_CHUNK_SIZE
-
-
-@pytest.mark.parametrize("chunk_size", [0, -1, -1000])
-def test_rejects_a_non_positive_chunk_size(factory_calls, chunk_size):
-    with pytest.raises(ValueError, match="chunk_size"):
-        make(chunk_size=chunk_size)
-
-
-# ---------------------------------------------------------------------------
-# State — nothing is known until a run starts
-# ---------------------------------------------------------------------------
-
-
-def test_verbose_turns_the_detail_on(factory_calls):
-    make(verbose=True)
-
-    assert logging.getLogger("pydblog").level == logging.DEBUG
-
-
-def test_staying_quiet_is_the_default(factory_calls):
-    """A library that configures logging unasked overrides its host's choices."""
-    package = logging.getLogger("pydblog")
-    package.setLevel(logging.NOTSET)
-
-    make()
-
-    assert package.level == logging.NOTSET
-
-
-def test_verbose_does_not_reach_the_connector(factory_calls):
-    make(verbose=True)
-
-    assert "verbose" not in factory_calls[0]
-
-
-def test_starts_with_empty_state(factory_calls):
-    dblog = make()
-
-    assert dblog._spec is None
-    assert dblog._last_lsn is None
-    assert dblog._chunk_key is None
-    assert dblog._dump_done is False
-
-
-def test_constructing_does_not_connect(factory_calls):
-    dblog = make()
-
-    assert dblog._connector.connects == 0
-
-
-# ---------------------------------------------------------------------------
-# Lifecycle
-# ---------------------------------------------------------------------------
-
-
-def test_connect_delegates_to_the_connector(factory_calls):
-    dblog = make()
-    dblog.connect()
-
-    assert dblog._connector.connects == 1
-    assert dblog._connector.closes == 0
-
-
-def test_close_delegates_to_the_connector(factory_calls):
-    dblog = make()
-    dblog.close()
-
-    assert dblog._connector.closes == 1
-
-
-def test_context_manager_connects_and_closes(factory_calls):
-    with make() as dblog:
-        assert dblog._connector.connects == 1
-        assert dblog._connector.closes == 0
-
-    assert dblog._connector.closes == 1
-
-
-def test_context_manager_yields_itself(factory_calls):
-    dblog = make()
-
-    with dblog as entered:
-        assert entered is dblog
-
-
-def test_context_manager_closes_when_the_body_raises(factory_calls):
-    dblog = make()
-
-    with pytest.raises(RuntimeError):
-        with dblog:
-            raise RuntimeError("boom")
-
-    assert dblog._connector.closes == 1
-
-
-def test_context_manager_does_not_swallow_the_exception(factory_calls):
-    """``__exit__`` must not return a truthy value."""
-    dblog = make()
-
-    with pytest.raises(ValueError):
-        with dblog:
-            raise ValueError("propagate me")
-
-
-# ---------------------------------------------------------------------------
-# _read_window — one pass over the log, from the last LSN to the current max LSN
-# ---------------------------------------------------------------------------
-
-def seeded(factory_calls, last_lsn: int = 10, max_lsn: int = 100) -> DBLog:
-    """A DBLog with the run state _read_window expects, staged by hand."""
-    dblog = make()
-    dblog._spec = SPEC
-    dblog._last_lsn = lsn(last_lsn)
-    dblog._connector.max_lsn = lsn(max_lsn)
-    return dblog
-
-
-def test_reads_from_the_last_lsn_up_to_the_current_max_lsn(factory_calls):
-    dblog = seeded(factory_calls, last_lsn=10, max_lsn=100)
-
-    dblog._read_window()
-
-    assert dblog._connector.event_log_calls == [(SPEC, lsn(10), lsn(100))]
-
-
-def test_returns_the_events_the_connector_read(factory_calls):
-    dblog = seeded(factory_calls)
-    dblog._connector.events = DataFrame({"sale_id": [1, 2]})
-
-    window = dblog._read_window()
-
-    assert window is not None
-    assert window.to_dicts() == [{"sale_id": 1}, {"sale_id": 2}]
-
-
-def test_advances_the_last_lsn_one_past_the_window(factory_calls):
-    """The CDC read is inclusive on both bounds, so reopening at the high LSN
-    would deliver every event sitting on the boundary a second time."""
-    dblog = seeded(factory_calls, last_lsn=10, max_lsn=100)
-
-    dblog._read_window()
-
-    assert dblog._last_lsn == lsn(101)
-
-
-def test_reads_the_window_whose_bounds_meet(factory_calls):
-    """A last LSN exactly at the max LSN is a one-LSN window, not an empty one."""
-    dblog = seeded(factory_calls, last_lsn=100, max_lsn=100)
-
-    dblog._read_window()
-
-    assert dblog._connector.event_log_calls == [(SPEC, lsn(100), lsn(100))]
-    assert dblog._last_lsn == lsn(101)
-
-
-def test_returns_none_when_the_window_holds_no_events(factory_calls):
-    dblog = seeded(factory_calls)
-    dblog._connector.events = None
-
-    assert dblog._read_window() is None
-
-
-def test_advances_the_last_lsn_even_when_the_window_was_empty(factory_calls):
-    """Otherwise a quiet table re-scans the same widening range forever."""
-    dblog = seeded(factory_calls, last_lsn=10, max_lsn=100)
-    dblog._connector.events = None
-
-    dblog._read_window()
-
-    assert dblog._last_lsn == lsn(101)
-
-
-def test_does_not_query_when_the_last_lsn_is_past_the_max_lsn(factory_calls):
-    """The steady state of a database with no new commits: it must cost nothing."""
-    dblog = seeded(factory_calls, last_lsn=101, max_lsn=100)
-
-    assert dblog._read_window() is None
-    assert dblog._connector.event_log_calls == []
-
-
-def test_leaves_the_last_lsn_alone_when_there_is_nothing_new(factory_calls):
-    dblog = seeded(factory_calls, last_lsn=101, max_lsn=100)
-
-    dblog._read_window()
-
-    assert dblog._last_lsn == lsn(101)
-
-
-@pytest.mark.parametrize("missing", ["_spec", "_last_lsn"])
-def test_refuses_to_read_a_window_before_the_run_state_is_seeded(
-    factory_calls, missing
-):
-    dblog = seeded(factory_calls)
-    setattr(dblog, missing, None)
-
-    with pytest.raises(RuntimeError, match="not started"):
-        dblog._read_window()
-
-
-# ---------------------------------------------------------------------------
-# Seeding — where a run starts reading from
-# ---------------------------------------------------------------------------
-
-
-def log_batch(dblog: DBLog) -> list[DataFrame]:
-    """
-    One events-only batch, which is all a call reads.
-
-    Returned as a list so a test can assert on a read that found nothing as easily as
-    on one that found events.
-    """
-    frame = dblog.fetch()
-    return [] if frame is None else [frame]
-
-
-def test_inspects_the_table_it_was_asked_for(factory_calls):
-    dblog = make(from_lsn=lsn(10))
-
-    log_batch(dblog)
-
-    assert dblog._connector.inspect_calls == [("dbo", "sales")]
-    assert dblog._spec == SPEC
-
-
-def test_seeds_the_run_once_however_many_batches_it_takes(factory_calls):
-    """Inspecting the table is a per-run cost, not a per-batch one."""
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2), sales(3, 4), sales(5)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
-
-    frames = dump_only(dblog)
-
-    assert len(frames) == 3
-    assert dblog._connector.inspect_calls == [("dbo", "sales")]
-
-
-def test_nothing_is_read_before_the_first_fetch(factory_calls):
-    """Construction settles what to read; it does not go and read it."""
-    dblog = dumping(factory_calls, chunk_size=2)
-
-    assert dblog._connector.inspect_calls == []
-    assert dblog._connector.calls == []
-
-
-def test_an_events_only_run_must_be_told_its_interval(factory_calls):
-    """
-    With no chunks to establish current state, a default would be a guess: start at
-    the floor and history the caller did not want gets replayed, start at the present
-    and history they did want is gone. Neither is detectable, so neither is a default.
-    """
-    with pytest.raises(ValueError, match="from_lsn"):
-        DBLog(**CONNECTION, **TARGET)
-
-
-def test_the_missing_interval_is_caught_at_construction(factory_calls):
-    """Nothing about it needs the source, so it costs no round trip to find out."""
-    with pytest.raises(ValueError):
-        DBLog(**CONNECTION, **TARGET)
-
-    assert factory_calls == []  # refused before the connector was even built
-
-
-def test_the_floor_itself_is_readable(factory_calls):
-    """
-    It is the first LSN retained, not the last one gone, and the CDC read is
-    inclusive — so an event sitting exactly on it is one of the events to read.
-    """
-    dblog = make(from_lsn=lsn(40))
-    dblog._connector.min_lsn = lsn(40)
-    dblog._connector.max_lsn = lsn(40)
-
-    log_batch(dblog)
-
-    assert dblog._connector.event_log_calls == [(SPEC, lsn(40), lsn(40))]
-
-
-def test_a_starting_dump_opens_at_the_present(factory_calls):
-    """
-    The chunks carry the table as it is now, so replaying the whole retention window
-    is work that buys nothing. A dump only needs what changes from the moment it
-    begins.
-    """
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=None)
-    dblog._connector.min_lsn = lsn(1)
-    dblog._connector.max_lsn = lsn(100)
-    dblog._connector.row_script = [sales(1)]
-
-    full_run(dblog)
-
-    assert dblog._connector.event_log_calls[0][1] == lsn(100)
-
-
-def test_a_starting_dump_falls_back_to_the_floor_above_the_max_lsn(factory_calls):
-    """
-    A capture instance enabled moments ago has a start_lsn the database-wide max has
-    not reached. Opening at the bare max would sit below the floor and be refused as
-    aged out.
-    """
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=None)
-    dblog._connector.min_lsn = lsn(200)
-    dblog._connector.max_lsn = lsn(50)
-    dblog._connector.row_script = [sales(1)]
-
-    full_run(dblog)
-
-    assert dblog._last_lsn == lsn(200)
-
-
-def test_a_starting_dump_still_honours_an_explicit_lsn(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(42))
-    dblog._connector.min_lsn = lsn(1)
-    dblog._connector.max_lsn = lsn(100)
-    dblog._connector.row_script = [sales(1)]
-
-    full_run(dblog)
-
-    assert dblog._connector.event_log_calls[0][1] == lsn(42)
-
-
-def test_a_resumed_dump_ignores_the_present(factory_calls):
-    """Opening at the max would skip everything between the record and now."""
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._connector.min_lsn = lsn(1)
-    dblog._connector.max_lsn = lsn(900)
-    dblog._store.states["sales-backfill"] = DumpState(
-        dump="sales-backfill", table="dbo.sales", last_lsn=lsn(500), chunk_key=77
-    )
-    dblog._connector.row_script = [sales(77)]
-
-    full_run(dblog)
-
-    assert dblog._connector.event_log_calls[0][1] == lsn(500)
-
-
-def test_an_unnamed_run_reads_exactly_the_interval_it_was_given(factory_calls):
-    """Only a dump gets a default: its chunks are what make skipping history safe."""
-    dblog = make(state_store=StubStore(), from_lsn=lsn(7))
-    dblog._connector.min_lsn = lsn(1)
-    dblog._connector.max_lsn = lsn(100)
-
-    log_batch(dblog)
-
-    assert dblog._connector.event_log_calls[0][1] == lsn(7)
-
-
-def test_starts_where_the_caller_asked(factory_calls):
-    dblog = make(from_lsn=lsn(42))
-    dblog._connector.min_lsn = lsn(1)
-    dblog._connector.max_lsn = lsn(100)
-
-    log_batch(dblog)
-
-    assert dblog._connector.event_log_calls[0][1] == lsn(42)
-
-
-def test_accepts_a_start_exactly_on_the_retention_floor(factory_calls):
-    """The floor is still readable; it is the first LSN CDC retains, not the last."""
-    dblog = make(from_lsn=lsn(40))
-    dblog._connector.min_lsn = lsn(40)
-
-    log_batch(dblog)
-
-    assert dblog._connector.event_log_calls[0][1] == lsn(40)
-
-
-def test_refuses_a_start_that_aged_out_of_retention(factory_calls):
-    """Reading from the floor instead would skip events with no signal at all."""
-    dblog = make(from_lsn=lsn(39))
-    dblog._connector.min_lsn = lsn(40)
-
-    with pytest.raises(CdcRetentionExpiredError, match="no longer retains"):
-        log_batch(dblog)
-
-
-def test_refuses_a_table_that_is_not_captured(factory_calls):
-    dblog = make(from_lsn=lsn(10))
-    dblog._connector.spec = SPEC.model_copy(update={"capture_instance": None})
-
-    with pytest.raises(ValueError, match="capture instance"):
-        log_batch(dblog)
-
-
-def test_starting_a_run_clears_the_dump_state(factory_calls):
-    dblog = make(from_lsn=lsn(10))
-    dblog._chunk_key = 999
-    dblog._dump_done = True
-
-    log_batch(dblog)
-
-    assert dblog._chunk_key is None
-    assert dblog._dump_done is False
-
-
-# ---------------------------------------------------------------------------
-# The dump name — the identity progress is recorded under, not a label
-# ---------------------------------------------------------------------------
-
-
-def test_records_the_dump_it_was_asked_to_run(factory_calls):
-    dblog = make(dump="sales-backfill", state_store=StubStore())
-
-    dblog.fetch()
-
-    assert dblog._dump == "sales-backfill"
-
-
-def test_an_unnamed_run_has_no_dump(factory_calls):
-    dblog = make(from_lsn=lsn(10))
-
-    log_batch(dblog)
-
-    assert dblog._dump is None
-
-
-@pytest.mark.parametrize("name", ["", "   ", "\t"])
-def test_refuses_a_blank_dump_name(factory_calls, name):
-    """A dump keyed on blank is indistinguishable from an unnamed run."""
-    with pytest.raises(ValueError, match="blank"):
-        make(dump=name, state_store=StubStore())
-
-
-def test_a_blank_dump_name_is_caught_at_construction(factory_calls):
-    """Decidable without the source, so it costs no round trip to find out."""
-    with pytest.raises(ValueError):
-        make(dump="")
-
-    assert factory_calls == []  # refused before the connector was even built
-
-
-# ---------------------------------------------------------------------------
-# _next_chunk — one keyset page of the table, sized by row count
-# ---------------------------------------------------------------------------
+    fields = {
+        "spec": SPEC,
+        "last_lsn": lsn(10),
+        "last_inspect": datetime.now(UTC),
+    }
+    return RunState(**{**fields, **overrides})
 
 
 def sales(*sale_ids: int) -> DataFrame:
     """A chunk of table rows, keyed the way SPEC says."""
     return DataFrame({"sale_id": list(sale_ids), "amount": [1] * len(sale_ids)})
-
-
-def dumping(
-    factory_calls, chunk_size: int = 3, chunk_key: int | None = None, **overrides
-) -> DBLog:
-    """
-    A DBLog mid-dump, staged by hand, with a store that stays in memory.
-
-    ``dump`` and ``from_lsn`` are constructor arguments now, so a test that overrides
-    them does it here rather than at the call that fetches.
-    """
-    dblog = make(
-        chunk_size=chunk_size,
-        state_store=StubStore(),
-        **{"dump": "sales-backfill", **overrides},
-    )
-    dblog._spec = SPEC
-    dblog._chunk_key = chunk_key
-    return dblog
-
-
-def test_first_chunk_reads_from_the_start_of_the_table(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=3)
-    dblog._connector.rows = sales(1, 2, 3)
-
-    dblog._next_chunk()
-
-    assert dblog._connector.read_table_calls == [(SPEC, None, None, 3)]
-
-
-def test_later_chunks_read_from_where_the_last_one_stopped(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=3, chunk_key=7)
-    dblog._connector.rows = sales(7, 8, 9)
-
-    dblog._next_chunk()
-
-    assert dblog._connector.read_table_calls == [(SPEC, 7, None, 3)]
-
-
-def test_returns_the_rows_it_read(factory_calls):
-    dblog = dumping(factory_calls)
-    dblog._connector.rows = sales(1, 2, 3)
-
-    chunk = dblog._next_chunk()
-
-    assert chunk is not None
-    assert chunk.to_dicts() == sales(1, 2, 3).to_dicts()
-
-
-def test_advances_past_the_last_row_of_the_chunk(factory_calls):
-    """start_pk is inclusive, so without the +1 the last row opens the next chunk."""
-    dblog = dumping(factory_calls, chunk_size=3)
-    dblog._connector.rows = sales(1, 5, 9)
-
-    dblog._next_chunk()
-
-    assert dblog._chunk_key == 10
-
-
-def test_a_full_chunk_leaves_the_dump_running(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=3)
-    dblog._connector.rows = sales(1, 2, 3)
-
-    dblog._next_chunk()
-
-    assert dblog._dump_done is False
-
-
-def test_a_short_chunk_ends_the_dump(factory_calls):
-    """Fewer rows than asked for means the table had no more to give."""
-    dblog = dumping(factory_calls, chunk_size=3)
-    dblog._connector.rows = sales(1, 2)
-
-    chunk = dblog._next_chunk()
-
-    assert chunk is not None
-    assert chunk.height == 2
-    assert dblog._dump_done is True
-
-
-def test_an_empty_chunk_ends_the_dump_and_yields_nothing(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=3, chunk_key=99)
-    dblog._connector.rows = sales()
-
-    assert dblog._next_chunk() is None
-    assert dblog._dump_done is True
-
-
-def test_an_empty_chunk_does_not_move_the_chunk_key(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=3, chunk_key=99)
-    dblog._connector.rows = sales()
-
-    dblog._next_chunk()
-
-    assert dblog._chunk_key == 99
-
-
-def test_reads_nothing_once_the_dump_is_done(factory_calls):
-    dblog = dumping(factory_calls)
-    dblog._dump_done = True
-
-    assert dblog._next_chunk() is None
-    assert dblog._connector.read_table_calls == []
-
-
-def test_walks_the_table_one_chunk_at_a_time(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._connector.row_script = [sales(1, 2), sales(4, 8), sales(9)]
-
-    chunks = [dblog._next_chunk(), dblog._next_chunk(), dblog._next_chunk()]
-
-    assert [chunk.height if chunk is not None else None for chunk in chunks] == [2, 2, 1]
-    assert [call[1] for call in dblog._connector.read_table_calls] == [None, 3, 9]
-    assert dblog._dump_done is True
-
-
-def test_refuses_a_leading_key_that_repeats_inside_a_chunk(factory_calls):
-    """
-    read_table bounds on the leading key alone. If a chunk splits a key group,
-    advancing past that key drops its remaining rows, and no log event exists to
-    repair them — they were never modified.
-    """
-    dblog = dumping(factory_calls, chunk_size=3)
-    dblog._connector.rows = sales(1, 2, 2)
-
-    with pytest.raises(ValueError, match="not unique"):
-        dblog._next_chunk()
-
-
-def test_refuses_a_leading_key_that_is_not_an_integer(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._connector.rows = DataFrame({"sale_id": ["a", "b"], "amount": [1, 1]})
-
-    with pytest.raises(TypeError, match="integer"):
-        dblog._next_chunk()
-
-
-def test_refuses_a_boolean_leading_key(factory_calls):
-    """isinstance(True, int) is True, so a bit column would slip through unguarded."""
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._connector.rows = DataFrame({"sale_id": [False, True], "amount": [1, 1]})
-
-    with pytest.raises(TypeError, match="integer"):
-        dblog._next_chunk()
-
-
-def test_refuses_to_read_a_chunk_before_the_run_state_is_seeded(factory_calls):
-    dblog = make()
-
-    with pytest.raises(RuntimeError, match="not started"):
-        dblog._next_chunk()
-
-
-# ---------------------------------------------------------------------------
-# _supersede — the log wins, because its image is the newer one
-# ---------------------------------------------------------------------------
 
 
 def events(*sale_ids: int) -> DataFrame:
@@ -851,106 +224,463 @@ def events(*sale_ids: int) -> DataFrame:
     )
 
 
-def test_a_chunk_survives_a_window_that_held_no_events(factory_calls):
-    dblog = dumping(factory_calls)
+def full_run(
+    source: StubConnector, start: RunState | None = None, **kwargs
+) -> tuple[list[DataFrame], RunState]:
+    """
+    Every batch a run has to give, the way a caller's loop collects them.
 
-    merged = dblog._supersede(sales(1, 2, 3), None)
+    Threads the state the way a caller must, including off the result whose frame is
+    None: that one still advanced the log position.
+    """
+    frames: list[DataFrame] = []
+    carried = start
+    while True:
+        result = dblog(source, **TARGET, state=carried, **kwargs)
+        carried = result.state
+        if result.frame is None:
+            return frames, carried
+        frames.append(result.frame)
+
+
+def dump_only(
+    source: StubConnector, start: RunState | None = None, **kwargs
+) -> tuple[list[DataFrame], RunState]:
+    """The batches up to the end of the table, the way a backfill bounds its loop."""
+    frames: list[DataFrame] = []
+    carried = start
+    while carried is None or not carried.dump_done:
+        result = dblog(source, **TARGET, state=carried, **kwargs)
+        carried = result.state
+        if result.frame is not None:
+            frames.append(result.frame)
+    return frames, carried
+
+
+# ---------------------------------------------------------------------------
+# Arguments — what is refused without asking the source
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1, -1000])
+def test_rejects_a_non_positive_chunk_size(source, chunk_size):
+    with pytest.raises(ValueError, match="chunk_size"):
+        dblog(source, **TARGET, chunk_size=chunk_size)
+
+    assert source.calls == []  # refused before a single round trip
+
+
+def test_refuses_a_state_that_belongs_to_another_table(source):
+    """
+    Its chunk key is a position in that table's key space and its LSN was read against
+    that table's capture instance, so neither means anything here. The cheapest thing
+    that catches the wrong saved state being loaded.
+    """
+    with pytest.raises(ValueError, match="dbo.sales"):
+        dblog(source, schema="dbo", table="refunds", state=state())
+
+
+def test_the_wrong_table_is_caught_before_anything_is_read(source):
+    with pytest.raises(ValueError):
+        dblog(source, schema="dbo", table="refunds", state=state())
+
+    assert source.calls == []
+
+
+def test_refuses_a_table_that_is_not_captured(source):
+    """Nothing to read a change log from, and nothing to check a position against."""
+    source.spec = SPEC.model_copy(update={"capture_instance": None})
+
+    with pytest.raises(ValueError, match="capture instance"):
+        dblog(source, **TARGET)
+
+
+# ---------------------------------------------------------------------------
+# _read_window — one pass over the log, from the last LSN to the current max LSN
+# ---------------------------------------------------------------------------
+
+
+def test_reads_from_the_last_lsn_up_to_the_current_max_lsn(source):
+    source.max_lsn = lsn(100)
+
+    _read_window(source, state(last_lsn=lsn(10)))
+
+    assert source.event_log_calls == [(SPEC, lsn(10), lsn(100))]
+
+
+def test_returns_the_events_the_connector_read(source):
+    source.events = DataFrame({"sale_id": [1, 2]})
+
+    window, _ = _read_window(source, state())
+
+    assert window is not None
+    assert window.to_dicts() == [{"sale_id": 1}, {"sale_id": 2}]
+
+
+def test_advances_the_last_lsn_one_past_the_window(source):
+    """The CDC read is inclusive on both bounds, so reopening at the high LSN would
+    deliver every event sitting on the boundary a second time."""
+    source.max_lsn = lsn(100)
+
+    _, advanced = _read_window(source, state(last_lsn=lsn(10)))
+
+    assert advanced.last_lsn == lsn(101)
+
+
+def test_reads_the_window_whose_bounds_meet(source):
+    """A last LSN exactly at the max LSN is a one-LSN window, not an empty one."""
+    source.max_lsn = lsn(100)
+
+    _, advanced = _read_window(source, state(last_lsn=lsn(100)))
+
+    assert source.event_log_calls == [(SPEC, lsn(100), lsn(100))]
+    assert advanced.last_lsn == lsn(101)
+
+
+def test_returns_none_when_the_window_holds_no_events(source):
+    source.events = None
+
+    window, _ = _read_window(source, state())
+
+    assert window is None
+
+
+def test_advances_the_last_lsn_even_when_the_window_was_empty(source):
+    """Otherwise a quiet table re-scans the same widening range forever."""
+    source.max_lsn = lsn(100)
+    source.events = None
+
+    _, advanced = _read_window(source, state(last_lsn=lsn(10)))
+
+    assert advanced.last_lsn == lsn(101)
+
+
+def test_does_not_query_when_the_last_lsn_is_past_the_max_lsn(source):
+    """The steady state of a database with no new commits: it must cost nothing."""
+    source.max_lsn = lsn(100)
+
+    window, _ = _read_window(source, state(last_lsn=lsn(101)))
+
+    assert window is None
+    assert source.event_log_calls == []
+
+
+def test_leaves_the_last_lsn_alone_when_there_is_nothing_new(source):
+    source.max_lsn = lsn(100)
+    carried = state(last_lsn=lsn(101))
+
+    _, advanced = _read_window(source, carried)
+
+    assert advanced.last_lsn == lsn(101)
+
+
+def test_reading_a_window_leaves_the_state_it_was_given_alone(source):
+    """The state is threaded, not mutated: the caller's copy has to stay put."""
+    source.max_lsn = lsn(100)
+    carried = state(last_lsn=lsn(10))
+
+    _read_window(source, carried)
+
+    assert carried.last_lsn == lsn(10)
+
+
+# ---------------------------------------------------------------------------
+# Seeding — where a run with no state starts reading from
+# ---------------------------------------------------------------------------
+
+
+def test_inspects_the_table_it_was_asked_for(source):
+    dblog(source, **TARGET)
+
+    assert source.inspect_calls == [("dbo", "sales")]
+
+
+def test_a_state_carries_the_spec_so_later_calls_do_not_inspect(source):
+    """A round trip per batch is what carrying the spec in the state is for."""
+    source.row_script = [sales(1, 2), sales(3)]
+    source.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
+
+    full_run(source, chunk_size=2)
+
+    assert source.inspect_calls == [("dbo", "sales")]
+
+
+def test_a_starting_run_opens_at_the_present(source):
+    """
+    Its chunks carry the table as it is now, so replaying the log's whole retention
+    window would be work that changes nothing.
+    """
+    source.max_lsn = lsn(500)
+    source.min_lsn = lsn(1)
+
+    result = dblog(source, **TARGET, chunk_size=2)
+
+    assert source.event_log_calls[0][1] == lsn(500)
+    assert result.state.spec == SPEC
+
+
+def test_a_starting_run_falls_back_to_the_floor_above_the_max_lsn(source):
+    """
+    A capture instance enabled moments ago has a start LSN the database-wide max has
+    not reached, and opening at the bare max would sit below what the log retains.
+    """
+    source.max_lsn = lsn(50)
+    source.min_lsn = lsn(400)
+
+    result = dblog(source, **TARGET, chunk_size=2)
+
+    # Above the source's max, so there is no window to read yet and the position stays
+    # where it opened — which is the point: it is above the floor rather than below it.
+    assert result.state.last_lsn == lsn(400)
+    assert source.event_log_calls == []
+
+
+def test_a_starting_run_has_walked_none_of_the_table(source):
+    source.rows = sales(1, 2, 3)
+
+    result = dblog(source, **TARGET, chunk_size=3)
+
+    assert result.state.chunk_key == 4
+    assert result.state.dump_done is False
+    assert source.read_table_calls[0][1] is None  # from the start of the table
+
+
+def test_a_starting_run_stamps_when_it_inspected(source):
+    before = datetime.now(UTC)
+
+    result = dblog(source, **TARGET)
+
+    assert before <= result.state.last_inspect <= datetime.now(UTC)
+
+
+def test_starting_a_run_says_so_out_loud(source, caplog):
+    """
+    No state means "walk the whole table". A caller whose state load quietly returned
+    None re-dumps everything, which is expensive enough to warn about rather than
+    mention at info alongside the ordinary reads.
+    """
+    with caplog.at_level("WARNING"):
+        dblog(source, **TARGET)
+
+    assert "full dump of dbo.sales" in caplog.text
+
+
+def test_carrying_a_state_says_nothing_of_the_kind(source, caplog):
+    with caplog.at_level("WARNING"):
+        dblog(source, **TARGET, state=state())
+
+    assert caplog.text == ""
+
+
+# ---------------------------------------------------------------------------
+# _next_chunk — one keyset page of the table, sized by row count
+# ---------------------------------------------------------------------------
+
+
+def test_first_chunk_reads_from_the_start_of_the_table(source):
+    source.rows = sales(1, 2, 3)
+
+    _next_chunk(source, state(), 3)
+
+    assert source.read_table_calls == [(SPEC, None, None, 3)]
+
+
+def test_later_chunks_read_from_where_the_last_one_stopped(source):
+    source.rows = sales(7, 8, 9)
+
+    _next_chunk(source, state(chunk_key=7), 3)
+
+    assert source.read_table_calls == [(SPEC, 7, None, 3)]
+
+
+def test_returns_the_rows_it_read(source):
+    source.rows = sales(1, 2, 3)
+
+    rows, _ = _next_chunk(source, state(), 3)
+
+    assert rows is not None
+    assert rows["sale_id"].to_list() == [1, 2, 3]
+
+
+def test_advances_past_the_last_row_of_the_chunk(source):
+    """``read_table`` is inclusive on ``start_pk``, so reopening on that key would read
+    its row twice."""
+    source.rows = sales(1, 2, 3)
+
+    _, advanced = _next_chunk(source, state(), 3)
+
+    assert advanced.chunk_key == 4
+
+
+def test_a_full_chunk_leaves_the_dump_running(source):
+    source.rows = sales(1, 2, 3)
+
+    _, advanced = _next_chunk(source, state(), 3)
+
+    assert advanced.dump_done is False
+
+
+def test_a_short_chunk_ends_the_dump(source):
+    """Fewer rows than asked for means the table had nothing more to give."""
+    source.rows = sales(1, 2)
+
+    rows, advanced = _next_chunk(source, state(), 3)
+
+    assert rows is not None
+    assert advanced.dump_done is True
+
+
+def test_an_empty_chunk_ends_the_dump_and_yields_nothing(source):
+    source.rows = sales()
+
+    rows, advanced = _next_chunk(source, state(), 3)
+
+    assert rows is None
+    assert advanced.dump_done is True
+
+
+def test_an_empty_chunk_does_not_move_the_chunk_key(source):
+    source.rows = sales()
+
+    _, advanced = _next_chunk(source, state(chunk_key=7), 3)
+
+    assert advanced.chunk_key == 7
+
+
+def test_a_page_is_short_against_the_size_this_call_asked_for(source):
+    """
+    ``chunk_size`` may differ between calls, since pages are read by key and there is
+    no plan for a new size to invalidate. What must not happen is a full page of the
+    new size reading as short.
+    """
+    source.rows = sales(1, 2)
+
+    _, advanced = _next_chunk(source, state(), 2)
+
+    assert advanced.dump_done is False
+
+
+def test_reading_a_chunk_leaves_the_state_it_was_given_alone(source):
+    source.rows = sales(1, 2, 3)
+    carried = state(chunk_key=7)
+
+    _next_chunk(source, carried, 3)
+
+    assert carried.chunk_key == 7
+    assert carried.dump_done is False
+
+
+def test_refuses_a_leading_key_that_repeats_inside_a_chunk(source):
+    """Rows sharing a key would be split across chunks and the ones past the boundary
+    dropped."""
+    source.rows = DataFrame({"sale_id": [1, 2, 2], "amount": [1, 1, 1]})
+
+    with pytest.raises(ValueError, match="not unique"):
+        _next_chunk(source, state(), 3)
+
+
+def test_refuses_a_leading_key_that_is_not_an_integer(source):
+    source.rows = DataFrame({"sale_id": ["a", "b"], "amount": [1, 1]})
+
+    with pytest.raises(TypeError, match="integer"):
+        _next_chunk(source, state(), 2)
+
+
+def test_refuses_a_boolean_leading_key(source):
+    """A bool is an int as far as isinstance is concerned, and would produce a nonsense
+    key."""
+    source.rows = DataFrame({"sale_id": [True, False], "amount": [1, 1]})
+
+    with pytest.raises(TypeError, match="integer"):
+        _next_chunk(source, state(), 2)
+
+
+# ---------------------------------------------------------------------------
+# _supersede — the log wins, because its image is the newer one
+# ---------------------------------------------------------------------------
+
+
+def test_a_chunk_survives_a_window_that_held_no_events():
+    merged = _supersede(sales(1, 2, 3), None, SPEC)
 
     assert merged.to_dicts() == sales(1, 2, 3).to_dicts()
 
 
-def test_a_chunk_survives_an_empty_window_frame(factory_calls):
-    dblog = dumping(factory_calls)
-
-    merged = dblog._supersede(sales(1, 2, 3), events())
+def test_a_chunk_survives_an_empty_window_frame():
+    merged = _supersede(sales(1, 2, 3), events(), SPEC)
 
     assert merged.to_dicts() == sales(1, 2, 3).to_dicts()
 
 
-def test_drops_the_chunk_rows_the_window_already_carries(factory_calls):
+def test_drops_the_chunk_rows_the_window_already_carries():
     """The event is the newer image of that row; the chunk's copy is stale."""
-    dblog = dumping(factory_calls)
-
-    merged = dblog._supersede(sales(1, 2, 3), events(2))
+    merged = _supersede(sales(1, 2, 3), events(2), SPEC)
 
     assert merged["sale_id"].to_list() == [1, 3]
 
 
-def test_keeps_the_chunk_in_key_order(factory_calls):
+def test_keeps_the_chunk_in_key_order():
     """Chunks arrive ordered by primary key, and an unordered join would lose that."""
-    dblog = dumping(factory_calls)
-
-    merged = dblog._supersede(sales(1, 2, 3, 4, 5, 6), events(3))
+    merged = _supersede(sales(1, 2, 3, 4, 5, 6), events(3), SPEC)
 
     assert merged["sale_id"].to_list() == [1, 2, 4, 5, 6]
 
 
-def test_a_window_that_covers_the_whole_chunk_leaves_nothing(factory_calls):
-    dblog = dumping(factory_calls)
-
-    assert dblog._supersede(sales(1, 2), events(1, 2)).is_empty()
+def test_a_window_that_covers_the_whole_chunk_leaves_nothing():
+    assert _supersede(sales(1, 2), events(1, 2), SPEC).is_empty()
 
 
-def test_a_row_touched_twice_in_the_window_is_dropped_once(factory_calls):
+def test_a_row_touched_twice_in_the_window_is_dropped_once():
     """An insert then an update inside one window is two events for one key."""
-    dblog = dumping(factory_calls)
-
-    merged = dblog._supersede(sales(1, 2, 3), events(2, 2))
+    merged = _supersede(sales(1, 2, 3), events(2, 2), SPEC)
 
     assert merged["sale_id"].to_list() == [1, 3]
 
 
-def test_events_for_rows_outside_the_chunk_change_nothing(factory_calls):
-    dblog = dumping(factory_calls)
-
-    merged = dblog._supersede(sales(1, 2), events(90, 91))
+def test_events_for_rows_outside_the_chunk_change_nothing():
+    merged = _supersede(sales(1, 2), events(90, 91), SPEC)
 
     assert merged["sale_id"].to_list() == [1, 2]
 
 
-def test_a_window_that_supersedes_nothing_hands_back_the_same_frame(factory_calls):
+def test_a_window_that_supersedes_nothing_hands_back_the_same_frame():
     """
     Not merely an equal frame — the same one. The anti-join would return these rows
-    unchanged while materialising every column to do it, which on a wide chunk costs
-    as much memory again as the chunk itself. Identity is the assertion because it is
-    the only one that fails if that copy comes back.
+    unchanged while materialising every column to do it, which on a wide chunk costs as
+    much memory again as the chunk itself. Identity is the assertion because it is the
+    only one that fails if that copy comes back.
     """
-    dblog = dumping(factory_calls)
     chunk = sales(1, 2, 3)
 
-    assert dblog._supersede(chunk, events(90, 91)) is chunk
+    assert _supersede(chunk, events(90, 91), SPEC) is chunk
 
 
-def test_a_window_that_supersedes_something_still_rebuilds(factory_calls):
+def test_a_window_that_supersedes_something_still_rebuilds():
     """The short circuit must not swallow a real overlap."""
-    dblog = dumping(factory_calls)
     chunk = sales(1, 2, 3)
 
-    merged = dblog._supersede(chunk, events(2))
+    merged = _supersede(chunk, events(2), SPEC)
 
     assert merged is not chunk
     assert merged["sale_id"].to_list() == [1, 3]
 
 
-def test_the_merged_chunk_keeps_the_table_columns(factory_calls):
+def test_the_merged_chunk_keeps_the_table_columns():
     """The window's metadata columns must not leak into the chunk's schema."""
-    dblog = dumping(factory_calls)
-
-    merged = dblog._supersede(sales(1, 2), events(1))
+    merged = _supersede(sales(1, 2), events(1), SPEC)
 
     assert merged.columns == ["sale_id", "amount"]
 
 
-def test_matches_on_every_primary_key_column(factory_calls):
+def test_matches_on_every_primary_key_column():
     """A composite key must match on the whole key, not just its leading column."""
-    dblog = dumping(factory_calls)
-    dblog._spec = SPEC.model_copy(update={"pk_columns": ["tenant_id", "sale_id"]})
+    spec = SPEC.model_copy(update={"pk_columns": ["tenant_id", "sale_id"]})
     chunk = DataFrame({"tenant_id": [1, 1, 2], "sale_id": [7, 8, 7]})
     window = DataFrame(
         {"operation": [4], "tenant_id": [1], "sale_id": [7], "amount": [99]}
     )
 
-    merged = dblog._supersede(chunk, window)
+    merged = _supersede(chunk, window, spec)
 
     assert merged.to_dicts() == [
         {"tenant_id": 1, "sale_id": 8},
@@ -959,42 +689,22 @@ def test_matches_on_every_primary_key_column(factory_calls):
 
 
 # ---------------------------------------------------------------------------
-# run(dump=...) — the dump interleaved with the log
+# The dump interleaved with the log
 # ---------------------------------------------------------------------------
 
 
-def full_run(dblog: DBLog) -> list[DataFrame]:
-    """Every batch a dump run has to give, the way a caller's loop collects them."""
-    frames = []
-    while (frame := dblog.fetch()) is not None:
-        frames.append(frame)
-    return frames
-
-
-def committing_run(dblog: DBLog) -> list[DataFrame]:
-    """A full run that commits each frame, the way a consumer that writes them does."""
-    frames = []
-    while (frame := dblog.fetch()) is not None:
-        frames.append(frame)
-        dblog.commit()
-    return frames
-
-
-def test_closes_the_window_after_the_chunk_it_brackets(factory_calls):
+def test_closes_the_window_after_the_chunk_it_brackets(source):
     """
-    The window has to cover the chunk scan. Reading it first would leave every
-    write made during the scan unaccounted for by either side.
+    The window has to cover the chunk scan. Reading it first would leave every write
+    made during the scan unaccounted for by either side.
     """
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2), sales(3)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
+    source.row_script = [sales(1, 2), sales(3)]
+    source.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
 
-    full_run(dblog)
+    full_run(source, state(), chunk_size=2)
 
     reads = [
-        call
-        for call in dblog._connector.calls
-        if call in ("read_table", "read_event_log")
+        call for call in source.calls if call in ("read_table", "read_event_log")
     ]
 
     assert reads[:4] == [
@@ -1005,65 +715,60 @@ def test_closes_the_window_after_the_chunk_it_brackets(factory_calls):
     ]
 
 
-def test_emits_the_window_before_the_chunk_it_brackets(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2)]
-    dblog._connector.event_script = [events(50)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+def test_emits_the_window_before_the_chunk_it_brackets(source):
+    source.row_script = [sales(1, 2)]
+    source.event_script = [events(50)]
+    source.max_lsn_script = [lsn(200), lsn(300)]
 
-    frames = full_run(dblog)
+    frames, _ = full_run(source, state(), chunk_size=2)
 
     assert len(frames) == 1
     assert frames[0]["sale_id"].to_list() == [50, 1, 2]
 
 
-def test_the_window_supersedes_the_chunk_rows_it_covers(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=3, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2, 3), sales(4)]
-    dblog._connector.event_script = [events(2), None]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
+def test_the_window_supersedes_the_chunk_rows_it_covers(source):
+    source.row_script = [sales(1, 2, 3), sales(4)]
+    source.event_script = [events(2), None]
+    source.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
 
-    frames = full_run(dblog)
+    frames, _ = full_run(source, state(), chunk_size=3)
 
     assert [frame["sale_id"].to_list() for frame in frames] == [[2, 1, 3], [4]]
 
 
-def test_chunk_frames_are_stamped_into_the_event_shape(factory_calls):
-    """A dump run yields one schema, so a consumer can stack every frame it gets."""
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+def test_chunk_frames_are_stamped_into_the_event_shape(source):
+    """A run yields one schema, so a consumer can stack every frame it gets."""
+    source.row_script = [sales(1, 2)]
+    source.max_lsn_script = [lsn(200), lsn(300)]
 
-    frames = full_run(dblog)
+    frames, _ = full_run(source, state(), chunk_size=2)
 
     assert frames[0].columns[:3] == ["start_lsn", "operation", "commit_timestamp"]
 
 
-def test_chunk_frames_are_stamped_even_when_the_window_was_empty(factory_calls):
+def test_chunk_frames_are_stamped_even_when_the_window_was_empty(source):
     """The early return for an empty window used to skip straight past the stamping."""
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2)]
-    dblog._connector.event_script = [None]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+    source.row_script = [sales(1, 2)]
+    source.event_script = [None]
+    source.max_lsn_script = [lsn(200), lsn(300)]
 
-    frames = full_run(dblog)
+    frames, _ = full_run(source, state(), chunk_size=2)
 
     assert frames[0]["operation"].to_list() == [0, 0]
 
 
-def test_a_chunk_is_bracketed_by_two_watermarks(factory_calls):
+def test_a_chunk_is_bracketed_by_two_watermarks(source):
     """
-    The algorithm, in the order it has to happen: a watermark, the chunk scan, a
-    second watermark, then the wait that makes the second one mean something. Only
-    then may the window close.
+    The algorithm, in the order it has to happen: a watermark, the chunk scan, a second
+    watermark, then the wait that makes the second one mean something. Only then may
+    the window close.
     """
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+    source.row_script = [sales(1, 2)]
+    source.max_lsn_script = [lsn(200), lsn(300)]
 
-    full_run(dblog)
+    full_run(source, state(), chunk_size=2)
 
-    assert dblog._connector.calls[:5] == [
+    assert source.calls[:5] == [
         "watermark",
         "read_table",
         "watermark",
@@ -1072,485 +777,447 @@ def test_a_chunk_is_bracketed_by_two_watermarks(factory_calls):
     ]
 
 
-def test_the_chunk_is_awaited_on_the_watermark_taken_after_it(factory_calls):
+def test_the_chunk_is_awaited_on_the_watermark_taken_after_it(source):
     """The one before the scan cannot prove the scan's own changes were captured."""
-    # One row, one pass, one pair of watermarks.
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+    source.row_script = [sales(1)]
+    source.max_lsn_script = [lsn(200), lsn(300)]
 
-    full_run(dblog)
+    full_run(source, state(), chunk_size=2)
 
-    taken, awaited = dblog._connector.watermarks, dblog._connector.awaited
-
-    assert awaited == [taken[1]]
+    assert source.awaited == [source.watermarks[1]]
 
 
-def test_chunk_frames_are_dated_from_the_watermark_before_the_chunk(factory_calls):
+def test_chunk_frames_are_dated_from_the_watermark_before_the_chunk(source):
     """Dated from the low watermark, not the high — that one is taken after the read."""
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+    source.row_script = [sales(1, 2)]
+    source.max_lsn_script = [lsn(200), lsn(300)]
 
-    frames = full_run(dblog)
+    frames, _ = full_run(source, state(), chunk_size=2)
 
-    assert frames[0]["commit_timestamp"].to_list() == [
-        dblog._connector.watermarks[0]
-    ] * 2
+    assert frames[0]["commit_timestamp"].to_list() == [source.watermarks[0]] * 2
 
 
-def test_a_chunk_wholly_superseded_is_not_emitted(factory_calls):
+def test_a_chunk_wholly_superseded_is_not_emitted(source):
     """Yielding an empty frame would make a consumer handle a case that means nothing."""
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2)]
-    dblog._connector.event_script = [events(1, 2)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+    source.row_script = [sales(1, 2)]
+    source.event_script = [events(1, 2)]
+    source.max_lsn_script = [lsn(200), lsn(300)]
 
-    frames = full_run(dblog)
+    frames, _ = full_run(source, state(), chunk_size=2)
 
     assert [frame["sale_id"].to_list() for frame in frames] == [[1, 2]]
 
 
-def dump_only(dblog: DBLog) -> list[DataFrame]:
-    """The batches up to the end of the table, the way a backfill bounds its loop."""
-    frames = []
-    while not dblog.dump_done:
-        frame = dblog.fetch()
-        if frame is not None:
-            frames.append(frame)
-    return frames
-
-
-def test_walks_the_whole_table_and_then_leaves(factory_calls):
+def test_walks_the_whole_table_and_then_leaves(source):
     """
     A caller after the table and no more stops on ``dump_done``: events that landed
     after the last chunk are the log's business, and wait for whatever tails it.
     """
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2), sales(3)]
-    dblog._connector.event_script = [None, None, events(77)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400), lsn(500)]
+    source.row_script = [sales(1, 2), sales(3)]
+    source.event_script = [None, None, events(77)]
+    source.max_lsn_script = [lsn(200), lsn(300), lsn(400), lsn(500)]
 
-    frames = dump_only(dblog)
+    frames, carried = dump_only(source, state(), chunk_size=2)
 
     assert [frame["sale_id"].to_list() for frame in frames] == [[1, 2], [3]]
-    assert dblog.dump_done is True
+    assert carried.dump_done is True
 
 
-def test_a_finished_dump_does_not_bound_a_dump_on_another_instance(factory_calls):
-    """
-    ``dump_done`` starts False on every instance, so a loop may test it before the
-    first fetch. This used to be a trap: one instance took the dump name per call, and
-    a finished dump left the flag True for the next one, whose loop then never ran.
-    A run per instance is what makes the plain shape safe.
-    """
-    first = dumping(factory_calls, chunk_size=2, dump="first", from_lsn=lsn(10))
-    first._connector.row_script = [sales(1, 2), sales(3)]
-    first._connector.max_lsn_script = [lsn(200), lsn(300)]
-    dump_only(first)
-    assert first.dump_done is True
+def test_a_dump_of_an_empty_table_still_drains_the_log(source):
+    source.row_script = [sales()]
+    source.event_script = [events(5)]
+    source.max_lsn_script = [lsn(200), lsn(300)]
 
-    second = dumping(factory_calls, chunk_size=2, dump="second", from_lsn=lsn(10))
-    second._connector.row_script = [sales(4, 5), sales(6)]
-    second._connector.max_lsn_script = [lsn(400), lsn(500)]
-
-    assert second.dump_done is False
-    frames = dump_only(second)
-    assert [frame["sale_id"].to_list() for frame in frames] == [[4, 5], [6]]
-
-
-def test_a_dump_of_an_empty_table_still_drains_the_log(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales()]
-    dblog._connector.event_script = [events(5)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
-
-    frames = full_run(dblog)
+    frames, _ = full_run(source, state(), chunk_size=2)
 
     assert [frame["sale_id"].to_list() for frame in frames] == [[5]]
 
 
-def test_the_dump_reads_one_window_per_chunk_and_no_more(factory_calls):
+def test_the_dump_reads_one_window_per_chunk_and_no_more(source):
     """Each chunk gets the window bracketing it; none of them tails on its own."""
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2), sales(3)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
+    source.row_script = [sales(1, 2), sales(3)]
+    source.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
 
-    dump_only(dblog)
+    dump_only(source, state(), chunk_size=2)
 
-    assert dblog._connector.calls.count("read_event_log") == 2
-
-
-def test_a_call_past_the_end_of_the_table_tails_the_log(factory_calls):
-    """The table is walked, so a batch is a window on its own from here on."""
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2), sales(3)]
-    dblog._connector.event_script = [None, None, events(77)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300), lsn(400), lsn(500)]
-    dump_only(dblog)
-    walked = len(dblog._connector.read_table_calls)
-
-    frame = dblog.fetch()
-
-    assert frame is not None
-    assert frame["sale_id"].to_list() == [77]
-    assert len(dblog._connector.read_table_calls) == walked  # no further table read
+    assert source.calls.count("read_event_log") == 2
 
 
-def test_an_unnamed_run_records_nothing(factory_calls):
-    dblog = dumping(factory_calls)
-    dblog._connector.max_lsn = lsn(200)
+def test_walking_the_table_takes_as_many_calls_as_it_takes(source):
+    source.row_script = [sales(1, 2), sales(3, 4), sales(5)]
+    source.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
 
-    dblog.fetch()
+    frames, _ = dump_only(source, state(), chunk_size=2)
 
-    assert dblog._store.saves == []
+    assert [frame["sale_id"].to_list() for frame in frames] == [[1, 2], [3, 4], [5]]
 
 
 # ---------------------------------------------------------------------------
-# Restarting — a dump is long enough that it will be interrupted
+# Carrying on — the state is the handoff, and the only one there is
 # ---------------------------------------------------------------------------
 
 
-def test_records_progress_for_every_committed_chunk(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2), sales(3)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
+def test_a_batch_hands_back_where_the_next_one_carries_on_from(source):
+    source.rows = sales(1, 2, 3)
+    source.max_lsn = lsn(200)
 
-    committing_run(dblog)
+    result = dblog(source, **TARGET, state=state(last_lsn=lsn(10)), chunk_size=3)
 
-    assert [(save.chunk_key, save.done) for save in dblog._store.saves] == [
-        (3, False),
-        (4, True),
+    assert result.state.chunk_key == 4
+    assert result.state.last_lsn == lsn(201)
+
+
+def test_carrying_the_state_resumes_the_table_walk_where_it_stopped(source):
+    source.rows = sales(7, 8, 9)
+
+    dblog(source, **TARGET, state=state(chunk_key=7), chunk_size=3)
+
+    assert source.read_table_calls[0][1] == 7
+
+
+def test_carrying_the_state_resumes_the_log_where_it_stopped(source):
+    source.max_lsn = lsn(900)
+
+    dblog(source, **TARGET, state=state(last_lsn=lsn(500)), chunk_size=3)
+
+    assert source.event_log_calls[0][1] == lsn(500)
+
+
+def test_carrying_the_older_state_reads_the_same_batch_again(source):
+    """
+    A frame received but never saved is read again by the next call given the older
+    state. That is the at-least-once guarantee, and it is the whole reason the position
+    comes back rather than being written from in here.
+    """
+    source.rows = sales(1, 2, 3)
+    source.max_lsn = lsn(200)
+    carried = state(last_lsn=lsn(10))
+
+    first = dblog(source, **TARGET, state=carried, chunk_size=3)
+    again = dblog(source, **TARGET, state=carried, chunk_size=3)
+
+    assert first.frame is not None and again.frame is not None
+    assert first.frame["sale_id"].to_list() == again.frame["sale_id"].to_list()
+    assert source.read_table_calls[0][1] == source.read_table_calls[1][1]
+
+
+def test_a_run_writes_nothing_of_its_own(source, tmp_path, monkeypatch):
+    """
+    There is nowhere for it to write to. The old default was a JSON file in the working
+    directory, so this pins that no such thing reappears.
+    """
+    monkeypatch.chdir(tmp_path)
+    source.row_script = [sales(1, 2, 3), sales(4)]
+    source.max_lsn_script = [lsn(200), lsn(300)]
+
+    full_run(source, state(), chunk_size=3)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_state_a_call_was_given_is_never_mutated(source):
+    source.rows = sales(1, 2, 3)
+    source.max_lsn = lsn(200)
+    carried = state(last_lsn=lsn(10))
+
+    dblog(source, **TARGET, state=carried, chunk_size=3)
+
+    assert carried.chunk_key is None
+    assert carried.last_lsn == lsn(10)
+    assert carried.dump_done is False
+
+
+# ---------------------------------------------------------------------------
+# Tailing — a finished dump reads the log alone
+# ---------------------------------------------------------------------------
+
+
+def test_a_finished_dump_never_reads_the_table(source):
+    source.max_lsn = lsn(200)
+
+    dblog(source, **TARGET, state=state(dump_done=True))
+
+    assert source.read_table_calls == []
+
+
+def test_a_finished_dump_reads_the_window_from_where_it_stopped(source):
+    """The handoff: the position a walked table left behind opens the tail."""
+    source.max_lsn = lsn(900)
+    source.event_script = [events(77)]
+
+    result = dblog(source, **TARGET, state=state(last_lsn=lsn(500), dump_done=True))
+
+    assert source.event_log_calls == [(SPEC, lsn(500), lsn(900))]
+    assert result.frame is not None
+    assert result.frame["sale_id"].to_list() == [77]
+
+
+def test_a_walked_table_hands_its_position_to_the_tail(source):
+    """
+    End to end, in the shape a caller uses: walk the table, keep the state, then read
+    the log alone with it and nothing else.
+    """
+    source.row_script = [sales(1, 2), sales(3)]
+    source.event_script = [None, None, events(77)]
+    source.max_lsn_script = [lsn(200), lsn(300), lsn(400)]
+
+    _, walked = dump_only(source, state(), chunk_size=2)
+    reads = len(source.read_table_calls)
+
+    result = dblog(source, **TARGET, state=walked)
+
+    assert result.frame is not None
+    assert result.frame["sale_id"].to_list() == [77]
+    assert len(source.read_table_calls) == reads  # no further table read
+
+
+def test_a_finished_dump_takes_no_watermarks(source):
+    """There is no chunk scan to bracket, so the barrier has nothing to prove."""
+    source.max_lsn = lsn(200)
+
+    dblog(source, **TARGET, state=state(dump_done=True))
+
+    assert source.awaited == []
+
+
+def test_a_tail_that_found_nothing_still_advances(source):
+    """Which is why the caller has to keep the state off a result whose frame is None."""
+    source.max_lsn = lsn(200)
+    source.events = None
+
+    result = dblog(source, **TARGET, state=state(last_lsn=lsn(10), dump_done=True))
+
+    assert result.frame is None
+    assert result.state.last_lsn == lsn(201)
+
+
+def test_a_tail_reads_the_source_there_and_then(source):
+    """Polling belongs to the caller: one call, one window, as of now."""
+    source.max_lsn_script = [lsn(200), lsn(300)]
+    carried = state(last_lsn=lsn(10), dump_done=True)
+
+    first = dblog(source, **TARGET, state=carried)
+    second = dblog(source, **TARGET, state=first.state)
+
+    assert source.event_log_calls == [
+        (SPEC, lsn(10), lsn(200)),
+        (SPEC, lsn(201), lsn(300)),
     ]
+    assert second.state.last_lsn == lsn(301)
 
 
-def test_what_it_records_is_enough_to_resume_on(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2)]
-    dblog._connector.max_lsn_script = [lsn(200)]
+def test_a_tail_does_not_chase_a_log_end_that_keeps_moving(source):
+    """The window closes at the max LSN read once, not at wherever it has got to since."""
+    source.max_lsn_script = [lsn(200)]
+    source.events = None
 
-    committing_run(dblog)
+    result = dblog(source, **TARGET, state=state(last_lsn=lsn(10), dump_done=True))
 
-    first = dblog._store.saves[0]
-    assert first.dump == "sales-backfill"
-    assert first.table == "dbo.sales"
-    assert first.last_lsn == lsn(201)
-    assert first.chunk_key == 3
-
-
-def test_a_run_records_nothing_on_its_own(factory_calls):
-    """
-    Recording on the strength of a frame having been received would turn a failed
-    write into silent loss: the resume would skip rows the consumer never kept.
-    """
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2), sales(3, 4)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
-
-    full_run(dblog)
-
-    assert dblog._store.saves == []
-
-
-def test_an_uncommitted_run_is_read_again_from_the_start(factory_calls):
-    """The consumer's write failed, so the rows have to come round again."""
-    store = StubStore()
-
-    first = make(chunk_size=2, state_store=store, dump="sales-backfill")
-    first._connector.row_script = [sales(1, 2), sales(3)]
-    first._connector.max_lsn_script = [lsn(200), lsn(300)]
-    full_run(first)
-
-    second = make(chunk_size=2, state_store=store, dump="sales-backfill")
-    second._connector.row_script = [sales(1, 2)]
-    second._connector.max_lsn_script = [lsn(400)]
-    second.fetch()
-
-    assert second._connector.read_table_calls[0][1] is None
-
-
-def test_commit_records_nothing_before_a_run_has_started(factory_calls):
-    """Consumer code that commits unconditionally must not need a guard."""
-    dblog = make(state_store=StubStore())
-
-    dblog.commit()
-
-    assert dblog._store.saves == []
-
-
-def test_commit_records_nothing_for_a_run_with_no_dump(factory_calls):
-    """There is no name to key progress under; such a caller keeps last_lsn itself."""
-    dblog = make(state_store=StubStore(), from_lsn=lsn(10))
-    dblog._connector.max_lsn = lsn(200)
-
-    log_batch(dblog)
-    dblog.commit()
-
-    assert dblog._store.saves == []
-
-
-def test_committing_twice_records_the_same_position(factory_calls):
-    """It snapshots where the run is, so an extra call cannot advance anything."""
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._connector.row_script = [sales(1, 2), sales(3, 4)]
-    dblog._connector.max_lsn_script = [lsn(200), lsn(300)]
-
-    dblog.fetch()
-    dblog.commit()
-    dblog.commit()
-
-    assert len(dblog._store.saves) == 2
-    assert dblog._store.saves[0].model_dump() == dblog._store.saves[1].model_dump()
-
-
-def test_a_commit_after_the_run_records_the_finished_dump(factory_calls):
-    """
-    Two rows at chunk_size 2, so there is no short chunk to carry ``done`` out on: the
-    end is found by a batch that comes back empty, with nothing to commit alongside it.
-    A caller that commits once more after the loop records it anyway, and spares the
-    next run a read that finds nothing. Contrast
-    ``test_records_progress_for_every_committed_chunk``, where a short chunk does carry
-    it.
-    """
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1, 2)]
-    dblog._connector.max_lsn_script = [lsn(200)]
-
-    committing_run(dblog)
-    assert dblog._store.saves[-1].done is False
-
-    dblog.commit()
-
-    assert dblog._store.saves[-1].done is True
-
-
-def test_resumes_the_table_walk_where_it_stopped(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._store.states["sales-backfill"] = DumpState(
-        dump="sales-backfill", table="dbo.sales", last_lsn=lsn(500), chunk_key=77
-    )
-    dblog._connector.row_script = [sales(77, 78)]
-    dblog._connector.max_lsn_script = [lsn(600)]
-
-    full_run(dblog)
-
-    assert dblog._connector.read_table_calls[0][1] == 77
-
-
-def test_resumes_the_log_where_it_stopped(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._store.states["sales-backfill"] = DumpState(
-        dump="sales-backfill", table="dbo.sales", last_lsn=lsn(500), chunk_key=77
-    )
-    dblog._connector.row_script = [sales(77)]
-    dblog._connector.max_lsn_script = [lsn(600)]
-
-    full_run(dblog)
-
-    assert dblog._connector.event_log_calls[0][1] == lsn(500)
-
-
-def test_a_resume_ignores_the_lsn_the_caller_offered(factory_calls):
-    """Recorded progress wins: the caller's guess would leave a gap or repeat one."""
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._store.states["sales-backfill"] = DumpState(
-        dump="sales-backfill", table="dbo.sales", last_lsn=lsn(500), chunk_key=77
-    )
-    dblog._connector.row_script = [sales(77)]
-    dblog._connector.max_lsn_script = [lsn(600)]
-
-    full_run(dblog)
-
-    assert dblog._connector.event_log_calls[0][1] == lsn(500)
-
-
-def test_refuses_to_resume_from_a_position_that_aged_out(factory_calls):
-    """An interruption long enough to outlast retention cannot be resumed at all."""
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._connector.min_lsn = lsn(900)
-    dblog._store.states["sales-backfill"] = DumpState(
-        dump="sales-backfill", table="dbo.sales", last_lsn=lsn(500), chunk_key=77
-    )
-
-    with pytest.raises(CdcRetentionExpiredError, match="no longer retains"):
-        full_run(dblog)
-
-
-def test_refuses_a_dump_name_pointed_at_another_table(factory_calls):
-    """Its chunk key is a position in a key space this table does not share."""
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._store.states["sales-backfill"] = DumpState(
-        dump="sales-backfill", table="dbo.orders", last_lsn=lsn(500), chunk_key=77
-    )
-
-    with pytest.raises(ValueError, match="dbo.orders"):
-        full_run(dblog)
-
-
-def test_a_finished_dump_only_drains_the_log(factory_calls):
-    """Re-running a completed dump is safe: the table is done, the log is not."""
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._store.states["sales-backfill"] = DumpState(
-        dump="sales-backfill", table="dbo.sales", last_lsn=lsn(500), done=True
-    )
-    dblog._connector.event_script = [events(9)]
-    dblog._connector.max_lsn_script = [lsn(600), lsn(700)]
-
-    frames = full_run(dblog)
-
-    assert dblog._connector.read_table_calls == []
-    assert [frame["sale_id"].to_list() for frame in frames] == [[9]]
-
-
-def test_a_finished_dump_keeps_recording_where_the_log_reached(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2)
-    dblog._store.states["sales-backfill"] = DumpState(
-        dump="sales-backfill", table="dbo.sales", last_lsn=lsn(500), done=True
-    )
-    dblog._connector.event_script = [events(9)]
-    dblog._connector.max_lsn_script = [lsn(600), lsn(700)]
-
-    committing_run(dblog)
-
-    assert dblog._store.saves[-1].last_lsn == lsn(601)
-    assert dblog._store.saves[-1].done is True
-
-
-def test_an_interrupted_dump_picks_up_from_its_last_record(factory_calls):
-    """The whole point: a crash mid-dump costs one chunk, not the whole table."""
-    store = StubStore()
-
-    first = make(chunk_size=2, state_store=store, dump="sales-backfill")
-    first._connector.row_script = [sales(1, 2), sales(3, 4)]
-    first._connector.max_lsn_script = [lsn(200), lsn(300)]
-    taken = [first.fetch()]
-    first.commit()  # the first chunk was written; then the process "crashes"
-
-    second = make(chunk_size=2, state_store=store, dump="sales-backfill")
-    second._connector.row_script = [sales(3, 4), sales(5)]
-    second._connector.max_lsn_script = [lsn(400), lsn(500)]
-    resumed = full_run(second)
-
-    assert taken[0]["sale_id"].to_list() == [1, 2]
-    assert second._connector.read_table_calls[0][1] == 3
-    assert [frame["sale_id"].to_list() for frame in resumed] == [[3, 4], [5]]
-
-
-def test_a_dump_run_ends_at_the_handoff_position(factory_calls):
-    dblog = dumping(factory_calls, chunk_size=2, from_lsn=lsn(10))
-    dblog._connector.row_script = [sales(1)]
-    dblog._connector.max_lsn = lsn(200)
-
-    full_run(dblog)
-
-    assert dblog.last_lsn == lsn(201)
+    assert source.event_log_calls == [(SPEC, lsn(10), lsn(200))]
+    assert result.state.last_lsn == lsn(201)
 
 
 # ---------------------------------------------------------------------------
-# dump=None — read the log and nothing else; polling belongs to the caller
+# Retention — checked every call, because a saved state is the ordinary input
 # ---------------------------------------------------------------------------
 
 
-def test_a_run_with_no_dump_never_reads_the_table(factory_calls):
-    dblog = make(from_lsn=lsn(10))
-    dblog._connector.event_script = [DataFrame({"sale_id": [1]}), None]
+def test_refuses_a_position_that_aged_out_of_the_log(source):
+    source.min_lsn = lsn(500)
 
-    log_batch(dblog)
-    log_batch(dblog)
-
-    assert dblog._connector.read_table_calls == []
+    with pytest.raises(CdcRetentionExpiredError, match="dbo.sales"):
+        dblog(source, **TARGET, state=state(last_lsn=lsn(10)))
 
 
-def test_a_run_with_no_dump_has_no_table_left_to_walk(factory_calls):
+def test_a_position_exactly_on_the_floor_is_readable(source):
+    source.min_lsn = lsn(500)
+    source.max_lsn = lsn(900)
+
+    dblog(source, **TARGET, state=state(last_lsn=lsn(500), dump_done=True))
+
+    assert source.event_log_calls == [(SPEC, lsn(500), lsn(900))]
+
+
+def test_the_expired_position_is_caught_before_anything_is_read(source):
+    """The gap cannot be read, so reading part of it would only muddle the recovery."""
+    source.min_lsn = lsn(500)
+
+    with pytest.raises(CdcRetentionExpiredError):
+        dblog(source, **TARGET, state=state(last_lsn=lsn(10)))
+
+    assert source.event_log_calls == []
+    assert source.read_table_calls == []
+
+
+def test_a_state_that_aged_out_is_checked_on_every_call_not_only_the_first(source):
     """
-    There is no dump to finish, so the backfill loop has nothing to wait for. Reporting
-    False would leave ``while not dblog.dump_done`` spinning on a condition that
-    nothing can ever satisfy, one get_max_lsn round trip per turn, forever.
+    A state persisted days ago is the ordinary input now, so a position falling below
+    the floor is something that happens while nobody is looking.
     """
-    dblog = make(from_lsn=lsn(10))
+    source.max_lsn = lsn(900)
+    carried = state(last_lsn=lsn(500), dump_done=True)
+    first = dblog(source, **TARGET, state=carried)
 
-    assert dblog.dump_done is True
+    source.min_lsn = lsn(5000)
 
-    log_batch(dblog)
-
-    assert dblog.dump_done is True
-
-
-def test_the_backfill_loop_terminates_on_a_run_with_no_dump(factory_calls):
-    dblog = make(from_lsn=lsn(10))
-    dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
-
-    assert dump_only(dblog) == []
-    assert dblog._connector.calls == []  # and it asked the source nothing
+    with pytest.raises(CdcRetentionExpiredError):
+        dblog(source, **TARGET, state=first.state)
 
 
-def test_reads_one_window_and_stops(factory_calls):
+def test_a_fresh_run_after_an_expired_one_opens_above_the_floor(source):
+    """The recovery the error names: no state, and the run opens at the present."""
+    source.min_lsn = lsn(5000)
+    source.max_lsn = lsn(50)
+
+    result = dblog(source, **TARGET, chunk_size=2)
+
+    assert result.state.last_lsn >= lsn(5000)
+
+
+# ---------------------------------------------------------------------------
+# Re-inspecting — the spec in a long-lived state goes stale
+# ---------------------------------------------------------------------------
+
+
+def stale(**overrides) -> RunState:
+    """A state whose spec was read two days ago."""
+    return state(last_inspect=datetime.now(UTC) - timedelta(days=2), **overrides)
+
+
+def test_a_fresh_spec_is_not_re_read(source):
+    dblog(source, **TARGET, state=state(dump_done=True))
+
+    assert source.inspect_calls == []
+
+
+def test_a_stale_spec_is_re_read(source):
+    dblog(source, **TARGET, state=stale(dump_done=True))
+
+    assert source.inspect_calls == [("dbo", "sales")]
+
+
+def test_re_inspecting_restamps_the_state(source):
+    """Otherwise every call from here on re-inspects."""
+    before = datetime.now(UTC)
+
+    result = dblog(source, **TARGET, state=stale(dump_done=True))
+
+    assert result.state.last_inspect >= before
+
+
+def test_a_state_carried_on_after_a_re_inspect_does_not_inspect_again(source):
+    first = dblog(source, **TARGET, state=stale(dump_done=True))
+
+    dblog(source, **TARGET, state=first.state)
+
+    assert source.inspect_calls == [("dbo", "sales")]
+
+
+def test_never_re_inspects_when_told_not_to(source):
+    """Which pins the run to the table as it was when the run opened."""
+    dblog(source, **TARGET, state=stale(dump_done=True), inspect_every=None)
+
+    assert source.inspect_calls == []
+
+
+def test_a_zero_interval_re_inspects_every_call(source):
+    carried = state(dump_done=True)
+
+    first = dblog(source, **TARGET, state=carried, inspect_every=timedelta(0))
+    dblog(source, **TARGET, state=first.state, inspect_every=timedelta(0))
+
+    assert len(source.inspect_calls) == 2
+
+
+def test_a_column_added_to_the_source_alone_is_only_a_warning(source, caplog):
     """
-    A single call does not loop until caught up: on a table with a steady stream
-    of writes, the log's end keeps moving and a call that chased it would never
-    return. One window per call, and the caller loops for more.
+    CDC keeps the set its capture instance was created with, so neither read projects
+    the new column and no frame changes shape.
     """
-    dblog = make(from_lsn=lsn(10))
-    dblog._connector.max_lsn_script = [lsn(100), lsn(200)]
-    dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
+    source.spec_script = [SPEC_SOURCE_WIDENED]
 
-    frames = log_batch(dblog)
+    with caplog.at_level("WARNING"):
+        result = dblog(source, **TARGET, state=stale(dump_done=True))
 
-    assert [frame.to_dicts() for frame in frames] == [[{"sale_id": 1}]]
-    assert dblog._connector.calls.count("read_event_log") == 1
-
-
-def test_a_second_call_picks_up_where_the_first_left_off(factory_calls):
-    """The caller polls by calling again; the run carries its own position."""
-    dblog = make(from_lsn=lsn(10))
-    dblog._connector.max_lsn_script = [lsn(100)]
-    dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
-
-    log_batch(dblog)
-
-    dblog._connector.max_lsn_script = [lsn(200)]
-    dblog._connector.event_script = [DataFrame({"sale_id": [2]})]
-
-    frames = log_batch(dblog)
-
-    assert [frame.to_dicts() for frame in frames] == [[{"sale_id": 2}]]
-    assert dblog._connector.event_log_calls[-1][1] == lsn(101)
+    assert "note" in caplog.text
+    assert result.state.spec == SPEC_SOURCE_WIDENED
 
 
-def test_does_not_chase_a_log_end_that_keeps_moving(factory_calls):
-    """Three max LSNs are on offer, as a table under steady writes would produce;
-    the run still stops after the one window, not once the log looks caught up."""
-    dblog = make(from_lsn=lsn(10))
-    dblog._connector.max_lsn_script = [lsn(100), lsn(200), lsn(300)]
-    dblog._connector.event_script = [DataFrame({"sale_id": [1]})]
+def test_a_column_the_capture_instance_now_carries_stops_the_run(source):
+    """
+    Frames after this point would not stack with the ones already emitted, and a
+    consumer finds that out at its own concat long after the batch that caused it was
+    written.
+    """
+    source.spec_script = [SPEC_CAPTURE_WIDENED]
 
-    log_batch(dblog)
-
-    assert len(dblog._connector.event_log_calls) == 1
-
-
-def test_yields_nothing_when_there_is_no_new_event(factory_calls):
-    dblog = make(from_lsn=lsn(10))
-    dblog._connector.events = None
-
-    assert log_batch(dblog) == []
+    with pytest.raises(SchemaChangedError, match="note"):
+        dblog(source, **TARGET, state=stale(dump_done=True))
 
 
-def test_leaves_the_last_lsn_at_the_handoff_position(factory_calls):
-    """What the caller passes back as from_lsn on the next drain."""
-    dblog = make(from_lsn=lsn(10))
-    dblog._connector.max_lsn = lsn(100)
+def test_a_re_keyed_table_stops_the_run(source):
+    """The chunk key is a position in the old key space, and events can no longer be
+    matched against chunk rows on the same columns."""
+    source.spec_script = [SPEC_REKEYED]
 
-    log_batch(dblog)
+    with pytest.raises(SchemaChangedError, match="amount"):
+        dblog(source, **TARGET, state=stale(chunk_key=7))
 
-    assert dblog.last_lsn == lsn(101)
+
+def test_a_schema_change_is_caught_before_anything_is_read(source):
+    source.spec_script = [SPEC_CAPTURE_WIDENED]
+
+    with pytest.raises(SchemaChangedError):
+        dblog(source, **TARGET, state=stale())
+
+    assert source.event_log_calls == []
+    assert source.read_table_calls == []
 
 
-def test_a_call_reads_the_source_there_and_then(factory_calls):
-    """Not a generator: the batch is read by the call, not by consuming a result."""
-    dblog = make()
+def test_a_table_that_lost_its_capture_instance_stops_the_run(source):
+    source.spec_script = [SPEC.model_copy(update={"capture_instance": None})]
 
-    dblog.fetch()
+    with pytest.raises(ValueError, match="capture instance"):
+        dblog(source, **TARGET, state=stale(dump_done=True))
 
-    assert dblog._connector.inspect_calls == [("dbo", "sales")]
-    assert dblog._connector.calls.count("read_event_log") == 1
+
+def test_the_re_read_spec_is_what_the_reads_use(source):
+    """A spec adopted but not passed to the reads would be a re-inspect that did
+    nothing."""
+    source.spec_script = [SPEC_SOURCE_WIDENED]
+    source.max_lsn = lsn(200)
+
+    dblog(source, **TARGET, state=stale(dump_done=True))
+
+    assert source.event_log_calls == [(SPEC_SOURCE_WIDENED, lsn(10), lsn(200))]
+
+
+# ---------------------------------------------------------------------------
+# The state as a value — what a run hands back has to survive being written down
+#
+# That it round-trips at all is test_state.py's job; these are about a state that
+# went through a file still driving the algorithm.
+# ---------------------------------------------------------------------------
+
+
+def test_what_a_run_hands_back_round_trips_through_json(source):
+    source.rows = sales(1, 2, 3)
+    source.max_lsn = lsn(200)
+    result = dblog(source, **TARGET, state=state(), chunk_size=3)
+
+    restored = RunState.model_validate_json(result.state.model_dump_json())
+
+    assert restored == result.state
+
+
+def test_a_restored_state_carries_on_where_the_run_left_off(source):
+    source.rows = sales(7, 8, 9)
+    source.max_lsn = lsn(900)
+    carried = RunState.model_validate_json(
+        state(chunk_key=7, last_lsn=lsn(500)).model_dump_json()
+    )
+
+    dblog(source, **TARGET, state=carried, chunk_size=3)
+
+    assert source.read_table_calls[0][1] == 7
+    assert source.event_log_calls[0][1] == lsn(500)

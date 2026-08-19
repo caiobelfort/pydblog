@@ -3,67 +3,78 @@
 Streams a SQL Server table's changes, optionally interleaved with a chunked dump of
 its rows, using the [DBLog](https://arxiv.org/abs/2010.12597) algorithm over CDC.
 
-One call reads one batch and returns it as a polars DataFrame, or None once there is
-nothing left to read. Every frame shares one schema — change events and dump rows
-alike — so no frame needs reconciling against another. You write each one and commit,
-and the commit is what a later run resumes from:
+One call reads one batch and hands back two things: the batch as a polars DataFrame,
+and the state to carry on from. Every frame shares one schema — change events and dump
+rows alike — so no frame needs reconciling against another. You write the frame and keep
+the state, and the state is what the next call resumes from:
 
 ```python
-from pydblog.dblog import DBLog
+from pydblog.connectors.base import build_connector
+from pydblog.dblog import CdcRetentionExpiredError, SchemaChangedError, dblog
 
-with DBLog(
+source = build_connector(
     source_type="mssql",
     host="localhost", port="1433",
     user="sa", password="...", database="dblog_lab",
-    schema="dbo", table="sales", dump="sales-backfill",
-    chunk_size=1000,
-) as dblog:
-    while (frame := dblog.fetch()) is not None:
-        frame.write_delta("s3://lake/sales", mode="append")
-        dblog.commit()  # only now is that batch's position recorded
+)
+
+with source:
+    state = load_my_state()          # None the first time
+    while True:
+        try:
+            result = dblog(source, "dbo", "sales", state=state, chunk_size=1000)
+        except (CdcRetentionExpiredError, SchemaChangedError):
+            state = None             # dump the table again
+            continue
+
+        if result.frame is not None:
+            result.frame.write_delta("s3://lake/sales", mode="append")
+
+        save_my_state(result.state)   # ideally in the same transaction as that write
+        state = result.state
+
+        if result.frame is None:
+            break
 ```
 
-An instance is one run. The table and the dump identify the run rather than any batch
-of it, so they are constructor arguments and `fetch()` takes none: reading a second
-table, or the same table under a second dump name, is a second `DBLog`.
-
-Nothing is buffered and nothing is lazy: the batch is read by the call, and its size
-is bounded by `chunk_size` however large the table is. The first call inspects the
-table and loads whatever progress is recorded; the rest just advance.
-
-That loop runs until the table is walked *and* the log is caught up. To stop at the
-end of the table instead — a backfill rather than a tail — loop on `dump_done`:
+**The state controls everything.** With none, the run opens at the present and dumps the
+table. With one, the batch carries on from where that state left off. With one whose
+`dump_done` is set — which is what a state becomes once the table is walked — the batch
+is a window of the log alone, so the same call slides from dumping into tailing with
+nothing retrieved from anywhere. To stop at the end of the table instead — a backfill
+rather than a tail — loop on `state.dump_done`:
 
 ```python
-while not dblog.dump_done:
-    frame = dblog.fetch()
-    if frame is not None:
-        frame.write_delta("s3://lake/sales", mode="append")
-        dblog.commit()
+state = None
+while state is None or not state.dump_done:
+    result = dblog(source, "dbo", "sales", state=state, chunk_size=1000)
+    state = result.state
+    if result.frame is not None:
+        result.frame.write_delta("s3://lake/sales", mode="append")
+        save_my_state(state)
 ```
 
-`dump_done` is about the table walk, so it is `True` from the start when there is no
-`dump` — that loop does nothing at all for a log-only run, which is the honest answer
-to "walk the table" when there is no table walk to do. Log-only callers want the
-`is not None` shape above, or a poll of their own.
+Keep the state even off a result whose frame is `None`: an empty window still moved the
+log position, and dropping it makes the next call re-scan a widening range.
 
-Rows that came off the table rather than out of the log are marked with an all-zero
-`start_lsn` and `operation = 0`, a position CDC never issues.
+Nothing is buffered and nothing is lazy: the batch is read by the call, and its size is
+bounded by `chunk_size` however large the table is. Rows that came off the table rather
+than out of the log are marked with an all-zero `start_lsn` and `operation = 0`, a
+position CDC never issues.
 
-Naming a `dump` makes the run walk the table as well as the log, and gives `commit()`
-a name to record progress under, so an interrupted run resumes at the last chunk you
-committed. Leaving it out reads the change log only, and then requires a `from_lsn`.
+**Nothing is written anywhere but by you.** That is not a convenience — it is what stops
+a recorded position from getting ahead of the data it describes. The frame and the state
+come back together, so you can persist both or neither; a frame you received but never
+saved is read again by the next call given the older state, which is the at-least-once
+guarantee the algorithm already makes. Where the state lives, and when to dump the table
+again, are yours: `RunState` is a pydantic model, so `model_dump_json()` and
+`RunState.model_validate_json()` are all a file or a row needs.
 
-`commit()` is yours to call because only you know when the data is safe. A frame you
-received but never committed is read again on the next run; a position recorded before
-your write succeeded would put those rows out of reach for good.
-
-Worth one `commit()` after the loop as well as inside it. A short chunk ends the dump
-and arrives as a frame, so committing that frame records the dump as finished — but
-when the row count is an exact multiple of `chunk_size` there is no short chunk, and
-the end is found by a batch that comes back empty with nothing to commit alongside.
-Skipping that last call costs the next run one empty read to rediscover the end, and
-nothing else.
+The state carries the table's spec as `inspect()` described it, which is what settles
+the schema every frame shares. `dblog()` re-reads that spec once a day by default
+(`inspect_every`) and stops the run with `SchemaChangedError` if the capture instance
+has started projecting something else, rather than letting frames that no longer stack
+reach your `concat`.
 
 ## Requirements
 
@@ -127,9 +138,9 @@ drift.
 
 | Path | What lives there |
 | --- | --- |
-| `src/pydblog/dblog.py` | The algorithm: chunk, window, supersede, commit |
+| `src/pydblog/dblog.py` | The algorithm: chunk, window, supersede, merge |
 | `src/pydblog/connectors/base.py` | The `SourceConnector` Protocol every source implements |
 | `src/pydblog/connectors/mssql/connector.py` | SQL Server: CDC reads, table reads, `inspect()` |
 | `src/pydblog/connectors/mssql/schema.py` | The SQL Server → Arrow type map, and the schema every frame is cast to |
-| `src/pydblog/state.py` | Where dump progress is recorded |
+| `src/pydblog/state.py` | `RunState` and `BatchResult` — what a run carries, and what a call hands back |
 | `adls/` | Architecture decisions, with the measurements behind them |

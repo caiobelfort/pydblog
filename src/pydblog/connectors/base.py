@@ -1,5 +1,6 @@
 
 from datetime import datetime
+from types import TracebackType
 from pydblog.connectors.types import SourceType
 from pydblog.connectors.types import LSN
 from pydblog.connectors.types import TableSpec
@@ -44,6 +45,25 @@ class SourceConnector(Protocol):
 
     def close(self) -> None:
         "Close a connection to the database"
+        ...
+
+    def __enter__(self) -> "SourceConnector":
+        """
+        Open the connection and hand back the connector to read with.
+
+        The connector is what a caller holds open for the length of a run: the run
+        itself is a value passed through ``dblog()``, so there is nothing else with a
+        lifetime to manage.
+        """
+        ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        "Close the connection"
         ...
 
     def inspect(self, schema: str, table: str) -> TableSpec:

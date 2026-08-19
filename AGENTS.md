@@ -5,15 +5,17 @@ what will bite you.
 
 ## What this is
 
-The DBLog algorithm over SQL Server CDC. `DBLog.fetch()` interleaves a chunked table
-dump with the change log, returning one polars DataFrame per call.
+The DBLog algorithm over SQL Server CDC. `dblog()` interleaves a chunked table dump with
+the change log, returning one polars DataFrame per call plus the state to carry on from.
+There is no orchestrator object: the run is a value the caller threads.
 
-`DBLog` owns the algorithm; the connector owns the database. `DBLog._connector` is
-typed as the `SourceConnector` Protocol, not as `MSSQLConnector`, so the algorithm can
+`dblog()` owns the algorithm; the connector owns the database. Its `connector` argument
+is typed as the `SourceConnector` Protocol, not as `MSSQLConnector`, so the algorithm can
 only reach for the primitives every source must provide. Adding SQL Server specifics
 to `dblog.py` breaks that on purpose — put them behind a Protocol method instead.
 `dblog.py` imports no connector module at all; `build_connector()` in
-`connectors/base.py` is the only construction point.
+`connectors/base.py` is the only construction point, and the caller is the one who calls
+it.
 
 ## Commands
 
@@ -42,41 +44,50 @@ session creates. The script is idempotent.
 
 Each is unremarkable alone; the shape only makes sense together.
 
-**The run loop** (`DBLog.fetch()`) is the algorithm, and its ordering is load-bearing:
+**The run loop** (`dblog()`) is the algorithm, and its ordering is load-bearing:
 
 ```
 one call, one batch:
-  seed once             # _start(): inspect + store read, only on the first fetch
-  _window_low = get_max_lsn()      # before-watermark, for dating this chunk only
-  chunk  = _next_chunk()           # keyset page from _chunk_key
-  window = _read_window()          # (_last_lsn, get_max_lsn()], then _last_lsn = high+1
-  return _merge_chunk(chunk, window)  # one frame: window events, then _supersede
-                                      # (anti-join) + to_events (stamp) of the chunk
-                                      # caller calls commit() once it has written it
+  state or seed         # _seed(): inspect + open at max(get_max_lsn(), floor)
+  _refresh_spec()       # re-inspect if state.last_inspect is older than inspect_every
+  _check_retention()    # every call: state.last_lsn vs get_min_lsn()
+  low    = watermark()             # before-watermark, for dating this chunk only
+  chunk  = _next_chunk()           # keyset page from state.chunk_key
+  window = _read_window()          # (last_lsn, get_max_lsn()], then last_lsn = high+1
+  return BatchResult(              # one frame: window events, then _supersede
+      _merge_chunk(...), state)    # (anti-join) + to_events (stamp) of the chunk
+                                   # plus the state the caller carries to the next call
 ```
 
-`fetch()` returns one frame, or None when the table is walked and the log is caught up.
-It is not a generator and holds nothing back: the read happens in the call. Past the
-end of the table a batch is a window alone, so a plain `while fetch() is not None` loop
-slides from dumping into tailing — `dump_done` is there for a caller that wants to
-stop at the end of the table instead.
+`dblog()` returns one frame, or None when the table is walked and the log is caught up.
+It is not a generator and holds nothing back: the read happens in the call. Past the end
+of the table a batch is a window alone, so a plain loop slides from dumping into tailing
+— `state.dump_done` is there for a caller that wants to stop at the end of the table
+instead.
 
-**An instance is one run.** `schema`, `table`, `dump` and `from_lsn` are constructor
-arguments, so `fetch()` takes none: they identify the run, not a batch of it. A second
-table or a second dump name is a second `DBLog` — which is why the integration fixture
-is a factory rather than one shared instance.
+**The run is a value.** There is no object holding a position: `dblog()` takes the state
+it was given and returns the state it reached, and the caller threads it. Nothing in this
+package reads or writes that state anywhere, which is the point — a position cannot get
+ahead of the data it describes when the frame and the position come back in the same
+`BatchResult` and the caller persists both together. `commit()`, `StateStore` and
+`JsonFileStore` are gone for that reason; see
+`adls/2026-08-19-*-the-run-is-a-value.md`.
 
-That is also what makes `while not dblog.dump_done:` safe to write. It was not, back
-when `fetch()` took the dump name per call: the flag described whichever dump was last
-seeded, so a finished dump left it True and the next dump's loop never ran at all.
-`test_a_finished_dump_does_not_bound_a_dump_on_another_instance` pins that it starts
-False per instance.
+Two consequences worth knowing before changing anything here:
 
-`dump_done` is `self._dump is None or self._dump_done`, and the first half is not
-cosmetic: a log-only run has no table walk, so reporting False would leave that same
-loop spinning on a condition nothing can satisfy — one `get_max_lsn` round trip per
-turn, forever. Vacuous truth makes it terminate instead, at the cost of doing nothing,
-which is the right answer to "walk the table" when there is no dump.
+- **The position and the flag must never live in two places.** Back when `fetch()` took
+  the dump name per call while `_dump_done` lived on the instance, a finished dump left
+  the flag True and the next dump's loop never ran. Both now live in the one state, so
+  there is nothing left for them to disagree on. Do not add a cached position, a "last
+  result" attribute, or a store back into this module.
+- **A state advances even on an empty window.** `_read_window` moves `last_lsn` past a
+  window that held nothing, so a quiet table does not re-scan a widening range — which
+  means a caller must keep the state off a `BatchResult` whose frame is `None`. That is
+  also why `BatchResult` is one object rather than a tuple.
+
+**`state=None` means "dump the whole table"**, so `_seed` logs at *warning* level. A
+caller whose state load quietly returned `None` re-dumps everything; their bug, but an
+expensive enough one to say out loud.
 
 The window closes *after* the chunk scan, so anything committed during the scan lands
 inside it and the chunk cannot carry a stale row the window does not also correct.
@@ -96,17 +107,33 @@ read_table / read_event_log → cur.arrow() → conform(...) → DataFrame
 to_events(rows, spec, ts)   → stamps a dump chunk into the event schema
 ```
 
-**Resume** (`state.py`). `DumpState` writes `chunk_key` and `last_lsn` as a unit —
+**Resume** (`state.py`). `RunState` carries `chunk_key` and `last_lsn` as a unit —
 either alone would leave rows that neither the remaining chunks nor the remaining log
-would deliver. `JsonFileStore` writes to a temp file and `os.replace`s it, so an
-interrupted write leaves the previous state intact. Injecting a `StateStore` is how
-tests avoid the filesystem.
+would deliver — plus the `TableSpec` and the `last_inspect` stamp. It is frozen, and
+every helper advances it with `model_copy(update=...)` rather than in place: a value
+threaded through calls that could be mutated would be a contract in name only.
 
-Nothing is written until the caller calls `DBLog.commit()`. The run loop deliberately
-does not do it: receiving a frame is not the same as having written it, and a position
-recorded on the strength of receipt puts the rows behind it out of reach when the
-caller's own write then fails. Uncommitted frames are re-read, which is the safe
-direction to fail in — at-least-once is the guarantee the algorithm already makes.
+Nothing is written anywhere. Receiving a frame is not the same as having written it, and
+a position recorded on the strength of receipt puts the rows behind it out of reach when
+the caller's own write then fails — so the position comes back instead and the caller
+persists it alongside the data. A state that was never saved reads the same batch again,
+which is the safe direction to fail in: at-least-once is the guarantee the algorithm
+already makes.
+
+**Why the spec travels in the state.** It settles the schema of every frame, and re-reading
+it per call would be a round trip per batch — so it is read once at `_seed` and then only
+when `last_inspect` is older than `inspect_every` (one day by default). `inspect()`
+already calls `validate()`, which is where a captured column that vanished or whose type
+drifted is caught, so re-inspecting at all buys that for free. What `_refresh_spec` adds
+is the frame-schema question: `captured_columns` or `pk_columns` moving means the capture
+instance changed under the run, so it raises `SchemaChangedError`; `columns` alone moving
+means the source gained or lost a column CDC is not carrying, which no read projects, so
+it warns and carries on.
+
+`last_inspect` is stamped from `datetime.now(UTC)`, **not** `connector.watermark()`. The
+watermark rule below applies to a mark compared against the source's own record of
+progress; this one is only compared against itself, and using a watermark would add a
+round trip to every log-only call.
 
 An `LSN` is `bytes` — 10 bytes, big-endian, so byte order is numeric order and plain
 comparison works.
@@ -159,7 +186,7 @@ Cost is one capture polling interval per chunk — 5s by default, tunable with
 
 **Every frame a run returns has the same schema.** Change events and dump rows alike.
 Break this and the failure surfaces at the consumer's `pl.concat`, long after the
-chunk that caused it was committed.
+chunk that caused it was written.
 
 It holds because:
 
@@ -171,6 +198,11 @@ It holds because:
 - `TableSpec` is **frozen**, and `business_columns` is a **property** derived from
   `captured_columns` — not a field. `model_copy(update={"business_columns": ...})`
   silently does nothing; update `captured_columns` instead.
+- The spec lives in the `RunState`, so a run resumed in another process reads the table
+  as it was when the run opened rather than as it is now. That is the invariant, not a
+  staleness bug: a re-inspect per process would let the schema move mid-run silently.
+  `_refresh_spec` is where a move is allowed to be noticed, and it raises
+  `SchemaChangedError` rather than adopting a spec that projects something else.
 
 ## Things that are counter-intuitive and were measured
 
@@ -192,10 +224,10 @@ evidence is in `adls/2026-08-13-1730-one-schema-per-run.md`.
   change table cannot have a rowversion of its own. This is why `validate()` compares
   `arrow_type(...)` and not type names: comparing names rejects every table that has
   one.
-- **`_last_lsn` is not a real log position.** It sits one past where the last window
+- **`state.last_lsn` is not a real log position.** It sits one past where the last window
   closed, so `fn_cdc_map_lsn_to_time` returns NULL for it. Chunks are dated from a
   `get_max_lsn()` taken at the top of each pass. That watermark is for dating only —
-  the window must still open at `_last_lsn`, or events in between are skipped.
+  the window must still open at `state.last_lsn`, or events in between are skipped.
 
 ## Conventions
 
@@ -220,15 +252,24 @@ evidence is in `adls/2026-08-13-1730-one-schema-per-run.md`.
 | `tests/test_types.py` | no | `ColumnSpec` equality/hash, `TableSpec` derivation |
 | `tests/test_mssql_schema.py` | no | The type map, `conform`, `validate` |
 | `tests/test_dblog.py` | no | The algorithm, against `StubConnector` |
-| `tests/test_state.py`, `test_log.py` | no | Progress store, logging |
+| `tests/test_state.py`, `test_log.py` | no | `RunState` round trip and immutability, logging |
 | `tests/test_mssql.py` | mostly | The connector against a real server |
-| `tests/test_dblog_integration.py` | yes | That a whole run actually concatenates |
+| `tests/test_dblog_integration.py` | yes | That a whole run actually concatenates, and that a walked table hands off |
 
 `tests/test_mssql.py` mixes both: query-building tests run without a container, the
 rest are `@pytest.mark.integration`.
 
 The `StubConnector` in `tests/test_dblog.py` implements the whole Protocol. Add a
 Protocol method and you must add it there too.
+
+Two traps when writing a test that drives `dblog()`:
+
+- **Stage the table with `row_script`, not `rows`.** `rows` returns the same page every
+  call, so a full-size page never comes back short, the dump never finishes, and a
+  `while frame is not None` loop hangs rather than fails.
+- **Default `last_inspect` to now.** The `state()` helper does; a state stamped with a
+  literal past date re-inspects on every call and quietly breaks any assertion counting
+  `inspect_calls`.
 
 ## Gotchas
 

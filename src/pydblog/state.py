@@ -1,48 +1,57 @@
 """
-Where a dump's progress is kept between runs.
+What a run carries between calls, and what one call hands back.
 
-A dump is long enough that it will be interrupted — a dropped connection, a restart,
-a crash. What makes it restartable is remembering two things together: how far
-through the table it got, and where in the change log it was at that moment. Either
-one alone is useless, so they are written as a unit.
+A run is long enough that it will be interrupted — a dropped connection, a restart, a
+crash. What makes it restartable is remembering two things together: how far through the
+table it got, and where in the change log it was at that moment. Either one alone is
+useless, so they travel as a unit in a single frozen value the caller cannot split.
 
-``DBLog`` holds a ``StateStore``, not a file, so where that unit lands is a decision
-the caller makes rather than one the algorithm bakes in.
+``dblog()`` neither reads nor writes that value anywhere. It takes the state it was
+given and returns the state the call reached, so where it is kept — a file, a row, the
+same transaction as the data itself — is the caller's decision rather than one the
+algorithm bakes in. It also means a position cannot get ahead of the data it describes:
+the frame and the state come back together, and the caller writes both or neither.
 """
 
-import json
-import os
-from pathlib import Path
-from typing import Protocol
-from urllib.parse import quote
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
-from pydantic import BaseModel, field_serializer, field_validator
+from polars import DataFrame
+from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
 
-from pydblog.connectors.types import LSN
-
-DEFAULT_STATE_DIRECTORY = Path(".pydblog-state")
+from pydblog.connectors.types import LSN, TableSpec
 
 
-class DumpState(BaseModel):
+class RunState(BaseModel):
     """
-    How far a named dump got.
+    Everything a run needs to pick up where the last call left off.
+
+    Frozen, and every call returns a new one: a value threaded through calls that
+    could be mutated in place would be a contract in name only.
 
     Attributes:
-        dump: The dump's name, which is what it is looked up by.
-        table: Qualified name of the table being dumped. A dump name pointed at a
-            different table is a mistake, not a resume: the chunk key would be a
-            position in a key space that table does not share.
-        last_lsn: Where the change log had been read to.
+        spec: The table as ``inspect()`` described it. Carried rather than re-read
+            because it is what settles the schema every frame of the run shares, and
+            a spec re-read per call would be a round trip per batch. Refreshed on the
+            interval ``dblog()`` is given.
+        last_lsn: Where the next log window opens. One past the high bound of the last
+            window read, since the CDC read is inclusive on both ends — so it is not a
+            position the log ever issued.
+        last_inspect: When ``spec`` was read, so the next call knows whether it is
+            stale. Timezone-aware; a naive value is read as UTC.
         chunk_key: Leading primary key the next chunk starts at, or None before the
             first chunk.
-        done: Whether the table has been walked to the end.
+        dump_done: Whether the table has been walked to the end. Once it is True the
+            state reads windows alone, which is how a finished dump becomes a tail.
     """
 
-    dump: str
-    table: str
+    model_config = ConfigDict(frozen=True)
+
+    spec: TableSpec
     last_lsn: LSN
+    last_inspect: datetime
     chunk_key: int | None = None
-    done: bool = False
+    dump_done: bool = False
 
     @field_serializer("last_lsn")
     def _lsn_to_hex(self, value: LSN) -> str:
@@ -53,99 +62,35 @@ class DumpState(BaseModel):
     def _lsn_from_hex(cls, value: object) -> object:
         return bytes.fromhex(value) if isinstance(value, str) else value
 
-
-class StateStore(Protocol):
-    """Keeps the progress of named dumps."""
-
-    def load(self, dump: str) -> DumpState | None:
-        """
-        Fetch what a dump recorded, or None if it has never run.
-        """
-        ...
-
-    def save(self, state: DumpState) -> None:
-        """
-        Record a dump's progress, replacing whatever it recorded before.
-
-        A reader must never see a partial state: either the previous one stands or
-        the new one does.
-        """
-        ...
-
-    def clear(self, dump: str) -> None:
-        """
-        Forget a dump, so running it again starts from the beginning.
-
-        Forgetting one that never ran is not an error.
-        """
-        ...
+    @field_validator("last_inspect")
+    @classmethod
+    def _aware(cls, value: datetime) -> datetime:
+        # The interval check subtracts this from the current time, and mixing an aware
+        # and a naive datetime raises rather than comparing. A caller who built the
+        # state by hand gets read as UTC instead of a TypeError one day later.
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-class JsonFileStore:
+@dataclass(frozen=True, eq=False)
+class BatchResult:
     """
-    Keeps each dump's progress in its own JSON file.
+    What one call to ``dblog()`` produced: a frame, and where to carry on from.
 
-    Writes land on a temporary file that is then moved into place, so an interrupted
-    write leaves the previous state intact rather than a truncated one.
+    One object rather than a pair, because the second half is not optional. A caller
+    who drops it reads the same batch forever, and the state has to be kept even off
+    the result whose frame is None — a window advances ``last_lsn`` even when it held
+    nothing, so that an idle table does not re-scan an ever-widening range.
+
+    A dataclass rather than a model: it holds a polars frame, which no serialization
+    of the state should ever try to carry. ``eq=False`` because comparing two frames
+    yields a frame rather than a bool.
+
+    Attributes:
+        frame: The batch, or None when there was nothing to read — the table is walked
+            and the log is caught up as of this call. Not permanent: a later call picks
+            up whatever has landed since, so it ends a loop rather than the run.
+        state: Where the next call should carry on from.
     """
 
-    def __init__(self, directory: Path | str = DEFAULT_STATE_DIRECTORY) -> None:
-        """
-        Args:
-            directory: Where the files go. Created when the first one is written.
-        """
-
-        self.directory = Path(directory)
-
-    def _path(self, dump: str) -> Path:
-        # The name comes from the caller and becomes a filename, so a dump called
-        # "../x" must not write outside the directory. Percent-encoding keeps
-        # ordinary names readable and makes distinct names distinct files.
-        return self.directory / f"{quote(dump, safe='')}.json"
-
-    def load(self, dump: str) -> DumpState | None:
-        """
-        Fetch what a dump recorded, or None if it has never run.
-
-        Args:
-            dump: Name of the dump.
-
-        Returns:
-            Its recorded progress, or None.
-        """
-
-        path = self._path(dump)
-        if not path.exists():
-            return None
-
-        return DumpState.model_validate_json(path.read_text(encoding="utf-8"))
-
-    def save(self, state: DumpState) -> None:
-        """
-        Record a dump's progress, replacing whatever it recorded before.
-
-        Args:
-            state: The progress to record.
-        """
-
-        self.directory.mkdir(parents=True, exist_ok=True)
-
-        path = self._path(state.dump)
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(state.model_dump_json(indent=2), encoding="utf-8")
-
-        try:
-            os.replace(temporary, path)
-        except OSError:
-            temporary.unlink(missing_ok=True)
-            raise
-
-    def clear(self, dump: str) -> None:
-        """
-        Forget a dump, so running it again starts from the beginning.
-
-        Args:
-            dump: Name of the dump.
-        """
-
-        self._path(dump).unlink(missing_ok=True)
+    frame: DataFrame | None
+    state: RunState

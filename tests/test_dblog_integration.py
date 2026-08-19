@@ -2,11 +2,14 @@
 DBLog end to end, against a real SQL Server.
 
 ``test_dblog.py`` proves the orchestration against a stub. This file proves the one
-thing a stub cannot: that a whole run's frames actually stack. Every frame comes out
-of a different result set — some out of the change table, some off the table itself —
-and before the schema was pinned, nothing stopped two of them from disagreeing about
-a decimal's scale or a null column's type. A consumer only found out at the concat,
-with progress already checkpointed against the chunk that broke it.
+thing a stub cannot: that a whole run's frames actually stack. Every frame comes out of
+a different result set — some out of the change table, some off the table itself — and
+before the schema was pinned, nothing stopped two of them from disagreeing about a
+decimal's scale or a null column's type. A consumer only found out at the concat, with
+progress already checkpointed against the chunk that broke it.
+
+There is nothing to build here but the connection: the run is a value threaded through
+``dblog()``, so the two runs below share one connector and keep their own state.
 """
 
 from typing import NamedTuple
@@ -16,84 +19,70 @@ import pytest
 from polars import DataFrame
 
 from pydblog.connectors.mssql import LSN_WIDTH, OP_DUMP
-from pydblog.dblog import DBLog
-from pydblog.state import DumpState, StateStore
+from pydblog.dblog import dblog
+from pydblog.state import RunState
 
 from conftest import (
-    DATABASE,
     LAB_SCHEMA,
     LAB_TABLE,
-    SA_PASSWORD,
     execute,
     latest_change_lsn,
     scalar,
     wait_for_cdc,
 )
 
-
-class MemoryStore:
-    """A StateStore that keeps dump progress in memory, off the filesystem."""
-
-    def __init__(self) -> None:
-        self.states: dict[str, DumpState] = {}
-
-    def load(self, dump: str) -> DumpState | None:
-        return self.states.get(dump)
-
-    def save(self, state: DumpState) -> None:
-        self.states[state.dump] = state
-
-    def clear(self, dump: str) -> None:
-        self.states.pop(dump, None)
+# chunk_size is 2 against a table of more than that, so a run takes several chunks and
+# several windows — which is the case that matters, since a single frame can never
+# disagree with itself.
+CHUNK_SIZE = 2
 
 
-@pytest.fixture(scope="module")
-def dblog(sqlserver):
+def walk(connector, chunk_size: int = CHUNK_SIZE) -> tuple[list[DataFrame], RunState]:
     """
-    Builds a DBLog on the lab table for a named dump.
+    Every frame up to the end of the table, the way a backfill bounds its loop.
 
-    A factory rather than one instance, because an instance is one run: the dump is
-    fixed at construction, so the two runs below need one each.
+    Threads the state the way a caller must, since nothing else carries the position.
     """
-    store: StateStore = MemoryStore()
+    frames: list[DataFrame] = []
+    carried: RunState | None = None
 
-    def build(dump: str) -> DBLog:
-        return DBLog(
-            source_type="mssql",
-            host=sqlserver.get_container_host_ip(),
-            port=str(sqlserver.get_exposed_port(1433)),
-            user="sa",
-            password=SA_PASSWORD,
-            database=DATABASE,
+    while carried is None or not carried.dump_done:
+        result = dblog(
+            connector,
             schema=LAB_SCHEMA,
             table=LAB_TABLE,
-            dump=dump,
-            chunk_size=2,
-            state_store=store,
+            state=carried,
+            chunk_size=chunk_size,
         )
+        carried = result.state
+        if result.frame is not None:
+            frames.append(result.frame)
 
-    return build
+    return frames, carried
 
 
 @pytest.fixture(scope="module")
-def dumped(dblog, connector, spec) -> list[DataFrame]:
+def dumped(connector, spec) -> list[DataFrame]:
     """
     Every frame of a dump run, with writes landing while it walks the table.
 
-    chunk_size is 2 against a table of more than that, so the run takes several
-    chunks and several windows — which is the case that matters, since a single
-    frame can never disagree with itself.
-
     Module-scoped: one run answers every question below, and a dump run is not cheap.
     """
-    run = dblog("concat-proof")
     frames: list[DataFrame] = []
+    carried: RunState | None = None
     written = False
 
-    while not run.dump_done:
-        frame = run.fetch()
-        if frame is not None:
-            frames.append(frame)
+    while carried is None or not carried.dump_done:
+        result = dblog(
+            connector,
+            schema=LAB_SCHEMA,
+            table=LAB_TABLE,
+            state=carried,
+            chunk_size=CHUNK_SIZE,
+        )
+        carried = result.state
+        if result.frame is not None:
+            frames.append(result.frame)
 
         if not written:
             written = True
@@ -187,6 +176,71 @@ def test_dump_rows_are_dated_in_the_order_the_chunks_were_read(dumped):
     assert dated == sorted(dated)
 
 
+# ---------------------------------------------------------------------------
+# The handoff — a walked table's state reads the log and nothing else
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def handed_off(connector, spec) -> DataFrame:
+    """
+    A row written after a dump finished, read back through the dump's own final state.
+
+    The reason the state comes back out of ``dblog()`` at all: there is no other way to
+    open a log-only run exactly where the dump stopped, with nothing repeated and
+    nothing skipped.
+    """
+    _, walked = walk(connector)
+    assert walked.dump_done
+
+    before = latest_change_lsn(connector, spec.capture_instance) or bytes(10)
+    execute(
+        connector,
+        f"INSERT INTO {LAB_SCHEMA}.{LAB_TABLE} "
+        "(product_id, customer_id, quantity, unit_price, status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [911, 912, 3, 1.5, "HANDED_OFF"],
+    )
+    wait_for_cdc(connector, spec.capture_instance, before)
+
+    frames: list[DataFrame] = []
+    carried = walked
+    while True:
+        result = dblog(
+            connector, schema=LAB_SCHEMA, table=LAB_TABLE, state=carried
+        )
+        carried = result.state
+        if result.frame is None:
+            break
+        frames.append(result.frame)
+
+    return pl.concat(frames)
+
+
+@pytest.mark.integration
+def test_the_tail_carries_what_was_written_after_the_dump(handed_off):
+    assert "HANDED_OFF" in handed_off["status"].to_list()
+
+
+@pytest.mark.integration
+def test_the_tail_reads_the_log_and_not_the_table(handed_off):
+    """A finished dump has no table left to walk, so nothing may be marked as dumped."""
+    assert handed_off.filter(pl.col("operation") == OP_DUMP).is_empty()
+
+
+@pytest.mark.integration
+def test_the_tail_frames_still_share_the_run_s_schema(handed_off, dumped):
+    """The handoff is only useful if what comes after it stacks with what came before."""
+    assert pl.concat([*dumped, handed_off]).height == (
+        sum(frame.height for frame in dumped) + handed_off.height
+    )
+
+
+# ---------------------------------------------------------------------------
+# The barrier — a write landing inside a chunk scan
+# ---------------------------------------------------------------------------
+
+
 class Raced(NamedTuple):
     """What a run did to one row that changed while its chunk was being scanned."""
 
@@ -196,14 +250,14 @@ class Raced(NamedTuple):
 
 
 @pytest.fixture(scope="module")
-def raced(dblog, connector, spec) -> Raced:
+def raced(connector, spec) -> Raced:
     """
     A dump run with a write landing inside a chunk scan.
 
     ``_next_chunk`` and ``_read_window`` are adjacent in the loop, so wrapping
     ``read_table`` drops the write exactly where the paper's high watermark has to
-    cover: after the rows were read, before the window closes. Without the barrier
-    this reproduced a stale row every time.
+    cover: after the rows were read, before the window closes. Without the barrier this
+    reproduced a stale row every time.
     """
     target = scalar(connector, f"SELECT MIN(sale_id) FROM {LAB_SCHEMA}.{LAB_TABLE}")
     stale = scalar(
@@ -212,8 +266,7 @@ def raced(dblog, connector, spec) -> Raced:
         [target],
     )
 
-    run = dblog("race-proof")
-    original = run._connector.read_table
+    original = connector.read_table
     fired: list[int] = []
 
     def read_then_write(*args, **kwargs):
@@ -227,15 +280,11 @@ def raced(dblog, connector, spec) -> Raced:
             fired.append(target)
         return rows
 
-    run._connector.read_table = read_then_write
+    connector.read_table = read_then_write
     try:
-        frames = []
-        while not run.dump_done:
-            frame = run.fetch()
-            if frame is not None:
-                frames.append(frame)
+        frames, _ = walk(connector)
     finally:
-        run._connector.read_table = original
+        connector.read_table = original
 
     return Raced(
         fired=bool(fired),
@@ -254,8 +303,8 @@ def test_the_race_actually_happened(raced):
 def test_a_write_during_a_chunk_scan_does_not_escape_as_a_stale_row(raced):
     """
     The property the watermarks exist for. The chunk read the row before the update
-    committed, so without the barrier it emitted the pre-update value and the run
-    never corrected it.
+    committed, so without the barrier it emitted the pre-update value and the run never
+    corrected it.
     """
     dump_rows = raced.rows.filter(pl.col("operation") == OP_DUMP)
 

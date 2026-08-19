@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from math import ceil
 from time import monotonic, sleep
+from types import TracebackType
 
 import mssql_python
 from polars import Binary, DataFrame, Datetime, Int32, all, lit
@@ -817,6 +818,18 @@ class MSSQLConnector:
             self._conn.close()
             logger.info(f"disconnected from {self._host}:{self._port}/{self._database}")
             self._conn = None
+
+    def __enter__(self) -> "MSSQLConnector":
+        self.connect()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
 
     def increment_lsn(self, lsn: LSN) -> LSN:
         """Return the next LSN after ``lsn``.
